@@ -1,7 +1,7 @@
 // ==Plugin==
 // name: Excalidraw
 // description: Side-panel sketches synced per note (Excalidrawings collection + note links)
-// icon: ti-pencil
+// icon: ti-palette
 // ==/Plugin==
 
 // @generated BEGIN thymer-plugin-settings (source: plugins/public repo/plugin-settings/ThymerPluginSettingsRuntime.js — run: npm run embed-plugin-settings)
@@ -2426,11 +2426,13 @@ const EXCAL_PLUGIN_ID = 'excalidraw';
 const EXCAL_MODE_KEY = 'thymerext_ps_mode_excalidraw';
 const EXCAL_DRAW_PREFIX = 'excal_draw_v1_';
 const EXCAL_PANEL_TYPE = 'excalidraw-editor';
-const EXCAL_VERSION = '0.2.14';
-const EXCAL_FRAME_PAD = 12;
+const EXCAL_VERSION = '0.2.19';
+const EXCAL_ICON = 'ti-palette';
+const EXCAL_FRAME_PAD_X = 12;
+const EXCAL_FRAME_PAD_TOP = 28;
+const EXCAL_FRAME_PAD_BOTTOM = 12;
 const EXCAL_FRAME_RADIUS = 14;
 const EXCAL_INNER_RADIUS = 10;
-const EXCAL_MARKER_META = 'excalidraw:marker';
 const EXCAL_UMD_VERSION = '0.17.6';
 const EXCAL_DRAWINGS_COLL_NAME = 'Excalidrawings';
 const EXCAL_DRAWINGS_COLL_GUID_KEY = 'excal_drawings_coll_guid_v1';
@@ -2451,7 +2453,7 @@ function excalDrawingsCollectionShape() {
   return {
     ver: 1,
     name: EXCAL_DRAWINGS_COLL_NAME,
-    icon: 'ti-pencil',
+    icon: EXCAL_ICON,
     color: null,
     home: false,
     item_name: 'Drawing',
@@ -2500,6 +2502,11 @@ class Plugin extends AppPlugin {
     this._drawingRecordCache = new Map();
     this._drawingsCollEnsurePromise = null;
     this._cssInjected = false;
+    this._navChromeTimer = null;
+    this._navChromeRetryTimer = null;
+    this._navInterceptBusy = false;
+    this._excalStatusItem = null;
+    this._excalSidebarItem = null;
 
     const custom = this.getConfiguration()?.custom || {};
     this._cdnVersion = String(custom.cdnVersion || EXCAL_UMD_VERSION).trim() || EXCAL_UMD_VERSION;
@@ -2510,25 +2517,41 @@ class Plugin extends AppPlugin {
 
     this._cmdOpen = this.ui.addCommandPaletteCommand({
       label: `${EXCAL_PLUGIN_NAME}: Open drawing for this note`,
-      icon: 'ti-pencil',
+      icon: EXCAL_ICON,
       onSelected: () => {
         setTimeout(() => { void this._openDrawingPanel(); }, 80);
       },
     });
 
-    this._eventIds.push(this.events.on('panel.closed', (ev) => {
-      const session = this._panelSession;
-      const closedId = ev?.panel?.getId?.();
-      if (session?.panelId && closedId && session.panelId !== closedId) return;
-      try { session?._resizeObs?.disconnect?.(); } catch (_) {}
-      void this._flushPanelSession(true);
-      try { session?.reactRoot?.unmount?.(); } catch (_) {}
-      if (session && (!closedId || session.panelId === closedId)) {
-        this._panelSession = null;
-      }
-    }));
+    this._mountExcalSidebarItem();
+    this._mountExcalStatusBar();
+
+    if (this.events?.on) {
+      const onPanelChange = (ev) => {
+        this._schedulePanelChrome(ev?.panel);
+      };
+      this._eventIds.push(this.events.on('panel.navigated', onPanelChange));
+      this._eventIds.push(this.events.on('panel.focused', onPanelChange));
+      this._eventIds.push(this.events.on('record.updated', () => {
+        this._schedulePanelChrome(this.ui.getActivePanel?.());
+      }));
+      this._eventIds.push(this.events.on('panel.closed', (ev) => {
+        const session = this._panelSession;
+        const closedId = ev?.panel?.getId?.();
+        if (session?.panelId && closedId && session.panelId !== closedId) return;
+        try { session?._resizeObs?.disconnect?.(); } catch (_) {}
+        void this._flushPanelSession(true);
+        try { session?.reactRoot?.unmount?.(); } catch (_) {}
+        if (session && (!closedId || session.panelId === closedId)) {
+          this._panelSession = null;
+        }
+      }));
+    } else {
+      console.warn(`[${EXCAL_PLUGIN_NAME}] events API unavailable — property intercept and status bar sync disabled`);
+    }
 
     void this._bootDrawingsCollection();
+    setTimeout(() => this._schedulePanelChrome(this.ui.getActivePanel?.()), 600);
   }
 
   onUnload() {
@@ -2540,6 +2563,12 @@ class Plugin extends AppPlugin {
     this._panelSession = null;
     this._drawingRecordCache?.clear?.();
     try { this._cmdOpen?.remove?.(); } catch (_) {}
+    try { this._excalStatusItem?.remove?.(); } catch (_) {}
+    try { this._excalSidebarItem?.remove?.(); } catch (_) {}
+    this._excalStatusItem = null;
+    this._excalSidebarItem = null;
+    if (this._navChromeTimer) clearTimeout(this._navChromeTimer);
+    if (this._navChromeRetryTimer) clearTimeout(this._navChromeRetryTimer);
   }
 
   _excalSleep(ms) {
@@ -2811,11 +2840,13 @@ class Plugin extends AppPlugin {
       custom.plugin_id = EXCAL_PLUGIN_ID;
       changed = true;
     }
+    const wantIcon = desired.icon || EXCAL_ICON;
+    if (base.icon !== wantIcon) changed = true;
     if (!changed) return;
     const merged = {
       ...base,
       name: EXCAL_DRAWINGS_COLL_NAME,
-      icon: base.icon || desired.icon || 'ti-pencil',
+      icon: wantIcon,
       fields: curFields,
       page_field_ids: pageIds,
       managed: { fields: false, views: false, sidebar: false },
@@ -3011,7 +3042,7 @@ class Plugin extends AppPlugin {
     if (hasField) return true;
 
     fields.push({
-      icon: 'ti-pencil',
+      icon: EXCAL_ICON,
       id: EXCAL_SOURCE_FIELD_ID,
       label: EXCAL_SOURCE_FIELD_LABEL,
       type: 'record',
@@ -3189,7 +3220,22 @@ class Plugin extends AppPlugin {
 
   _setPanelStatus(session, statusText) {
     const status = String(statusText || '').trim();
-    if (session?.statusEl) session.statusEl.textContent = status || '';
+    const el = session?.statusEl;
+    if (!el) return;
+    el.textContent = status || '';
+    el.classList.remove(
+      'excal-status--idle',
+      'excal-status--dirty',
+      'excal-status--saving',
+      'excal-status--saved',
+      'excal-status--error',
+    );
+    const lower = status.toLowerCase();
+    if (lower.includes('fail')) el.classList.add('excal-status--error');
+    else if (lower.includes('unsaved')) el.classList.add('excal-status--dirty');
+    else if (lower.includes('saving')) el.classList.add('excal-status--saving');
+    else if (lower.includes('saved')) el.classList.add('excal-status--saved');
+    else if (status) el.classList.add('excal-status--idle');
   }
 
   _ensureStageChrome(stage, session) {
@@ -3274,10 +3320,20 @@ class Plugin extends AppPlugin {
       }
     }
 
-    const pad = EXCAL_FRAME_PAD * 2;
+    const padW = EXCAL_FRAME_PAD_X * 2;
+    const padH = EXCAL_FRAME_PAD_TOP + EXCAL_FRAME_PAD_BOTTOM;
     return {
-      w: Math.max(1, Math.round(w) - pad),
-      h: Math.max(200, Math.round(h) - pad),
+      w: Math.max(1, Math.round(w) - padW),
+      h: Math.max(200, Math.round(h) - padH),
+    };
+  }
+
+  _hostFrameInset() {
+    return {
+      top: `${EXCAL_FRAME_PAD_TOP}px`,
+      right: `${EXCAL_FRAME_PAD_X}px`,
+      bottom: `${EXCAL_FRAME_PAD_BOTTOM}px`,
+      left: `${EXCAL_FRAME_PAD_X}px`,
     };
   }
 
@@ -3324,13 +3380,13 @@ class Plugin extends AppPlugin {
     stage.style.height = '100%';
 
     if (host) {
-      const pad = `${EXCAL_FRAME_PAD}px`;
+      const inset = this._hostFrameInset();
       host.style.position = 'absolute';
-      host.style.inset = pad;
-      host.style.left = pad;
-      host.style.top = pad;
-      host.style.right = pad;
-      host.style.bottom = pad;
+      host.style.inset = `${inset.top} ${inset.right} ${inset.bottom} ${inset.left}`;
+      host.style.top = inset.top;
+      host.style.right = inset.right;
+      host.style.bottom = inset.bottom;
+      host.style.left = inset.left;
       host.style.width = 'auto';
       host.style.height = 'auto';
       host.style.maxWidth = 'none';
@@ -3346,6 +3402,31 @@ class Plugin extends AppPlugin {
 
   _markPanelAncestorsTransparent(el) {
     this._stretchPanelAncestors(el);
+  }
+
+  _excalThemeValue(theme) {
+    return theme === 'dark' || theme === 'light' ? theme : null;
+  }
+
+  _patchSceneJsonForStorage(sceneJson, appState) {
+    const theme = this._excalThemeValue(appState?.theme);
+    if (!theme || !sceneJson) return sceneJson;
+    try {
+      const parsed = typeof sceneJson === 'string' ? JSON.parse(sceneJson) : sceneJson;
+      if (!parsed || typeof parsed !== 'object') return sceneJson;
+      parsed.appState = { ...(parsed.appState || {}), theme };
+      return JSON.stringify(parsed);
+    } catch (e) {
+      console.warn(`[${EXCAL_PLUGIN_NAME}] patch scene theme`, e);
+      return sceneJson;
+    }
+  }
+
+  _syncStageTheme(session, theme) {
+    const value = this._excalThemeValue(theme);
+    if (!session?.stageEl) return;
+    if (value) session.stageEl.dataset.excalTheme = value;
+    else delete session.stageEl.dataset.excalTheme;
   }
 
   _createExcalidrawMountElement(React, Excalidraw, session, plugin, initialData) {
@@ -3403,20 +3484,28 @@ class Plugin extends AppPlugin {
       );
     };
 
+    const savedTheme = plugin._excalThemeValue(initialData?.appState?.theme);
+
     return React.createElement(ExcalidrawAutoSize, {
       initialData: initialData || undefined,
+      theme: savedTheme || undefined,
       UIOptions: {
         getFormFactor: () => 'desktop',
       },
       excalidrawAPI: (api) => {
         session.excalApi = api;
+        if (savedTheme) {
+          plugin._syncStageTheme(session, savedTheme);
+          try {
+            api.updateScene({ appState: { theme: savedTheme } });
+          } catch (_) {}
+        }
       },
       onChange: (elements, appState, files) => {
-        const live = (elements || []).filter((x) => x && !x.isDeleted);
-        if (!live.length && !(files && Object.keys(files).length)) return;
+        plugin._syncStageTheme(session, appState?.theme);
         session.pendingScene = plugin._serializeScene(session.excalLib, elements, appState, files);
         session.dirty = true;
-        plugin._setPanelStatus(session, 'Unsaved changes…');
+        plugin._setPanelStatus(session, 'Unsaved changes');
         clearTimeout(session.saveTimer);
         session.saveTimer = setTimeout(() => {
           void plugin._flushPanelSession(false);
@@ -3478,22 +3567,69 @@ class Plugin extends AppPlugin {
         color: inherit;
         overflow: hidden;
       }
-      .excal-panel-statusbar {
+      .excal-panel-stage > .excal-panel-statusbar {
         position: absolute;
-        top: ${EXCAL_FRAME_PAD + 8}px;
-        left: ${EXCAL_FRAME_PAD + 10}px;
-        z-index: 6;
-        padding: 2px 8px;
-        font-size: 11px;
-        opacity: 0.85;
-        background: rgba(0, 0, 0, 0.45);
-        color: #fff;
-        border-radius: 6px;
+        top: auto;
+        bottom: ${EXCAL_FRAME_PAD_BOTTOM + 14}px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 20;
+        padding: 9px 20px;
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        opacity: 1;
+        background: #0f172a !important;
+        color: #f8fafc !important;
+        border: 2px solid rgba(255, 255, 255, 0.45) !important;
+        border-radius: 10px;
         pointer-events: none;
-        max-width: calc(100% - ${EXCAL_FRAME_PAD * 2 + 20}px);
+        max-width: calc(100% - ${EXCAL_FRAME_PAD_X * 2 + 24}px);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+        box-shadow: 0 6px 24px rgba(0, 0, 0, 0.55) !important;
+        -webkit-font-smoothing: antialiased;
+      }
+      .excal-panel-stage > .excal-panel-statusbar.excal-status--dirty {
+        background: #ea580c !important;
+        color: #ffffff !important;
+        border-color: #fed7aa !important;
+        box-shadow: 0 0 0 3px rgba(234, 88, 12, 0.55), 0 6px 24px rgba(0, 0, 0, 0.55) !important;
+      }
+      .excal-panel-stage[data-excal-theme="dark"] > .excal-panel-statusbar.excal-status--dirty {
+        background: #fff7ed !important;
+        color: #9a3412 !important;
+        border-color: #fdba74 !important;
+        box-shadow: 0 0 0 3px rgba(255, 237, 213, 0.35), 0 6px 24px rgba(0, 0, 0, 0.65) !important;
+      }
+      .excal-panel-stage > .excal-panel-statusbar.excal-status--saving {
+        background: #2563eb !important;
+        color: #ffffff !important;
+        border-color: #bfdbfe !important;
+        box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.45), 0 6px 24px rgba(0, 0, 0, 0.55) !important;
+      }
+      .excal-panel-stage > .excal-panel-statusbar.excal-status--saved {
+        background: #16a34a !important;
+        color: #ffffff !important;
+        border-color: #bbf7d0 !important;
+        box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.4), 0 6px 24px rgba(0, 0, 0, 0.55) !important;
+      }
+      .excal-panel-stage[data-excal-theme="dark"] > .excal-panel-statusbar.excal-status--saved {
+        background: #dcfce7 !important;
+        color: #14532d !important;
+        border-color: #86efac !important;
+      }
+      .excal-panel-stage > .excal-panel-statusbar.excal-status--error {
+        background: #dc2626 !important;
+        color: #ffffff !important;
+        border-color: #fecaca !important;
+        box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.45), 0 6px 24px rgba(0, 0, 0, 0.55) !important;
+      }
+      .excal-panel-stage > .excal-panel-statusbar.excal-status--idle {
+        background: #1e293b !important;
+        color: #f1f5f9 !important;
+        border-color: rgba(255, 255, 255, 0.35) !important;
       }
       .excal-panel-stage {
         flex: 1 1 auto;
@@ -3524,7 +3660,7 @@ class Plugin extends AppPlugin {
       }
       .excal-panel-stage > .excal-host {
         position: absolute;
-        inset: ${EXCAL_FRAME_PAD}px;
+        inset: ${EXCAL_FRAME_PAD_TOP}px ${EXCAL_FRAME_PAD_X}px ${EXCAL_FRAME_PAD_BOTTOM}px ${EXCAL_FRAME_PAD_X}px;
         width: auto;
         height: auto;
         max-width: none;
@@ -3549,7 +3685,7 @@ class Plugin extends AppPlugin {
       }
       .excal-panel-loading {
         position: absolute;
-        inset: ${EXCAL_FRAME_PAD}px;
+        inset: ${EXCAL_FRAME_PAD_TOP}px ${EXCAL_FRAME_PAD_X}px ${EXCAL_FRAME_PAD_BOTTOM}px ${EXCAL_FRAME_PAD_X}px;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -3562,9 +3698,168 @@ class Plugin extends AppPlugin {
     `);
   }
 
-  _getActiveRecord() {
-    const panel = this.ui.getActivePanel?.();
-    return panel?.getActiveRecord?.() || null;
+  _readRecordRef(record, fieldId) {
+    if (!record || !fieldId) return '';
+    const ids = [fieldId];
+    if (fieldId === EXCAL_SOURCE_FIELD_ID) ids.push(EXCAL_SOURCE_FIELD_LABEL);
+    for (const id of ids) {
+      try {
+        const ref = record.reference?.(id);
+        if (ref) return String(ref).trim();
+      } catch (_) {}
+      try {
+        const p = record.prop?.(id);
+        if (p?.linkedRecord) {
+          const lr = p.linkedRecord();
+          if (lr?.guid) return String(lr.guid).trim();
+        }
+        const v = p?.get?.();
+        if (v && typeof v === 'object' && v.guid) return String(v.guid).trim();
+        if (v != null && String(v).trim()) return String(v).trim();
+      } catch (_) {}
+    }
+    return '';
+  }
+
+  _noteHasDrawingHint(record) {
+    if (!record?.guid) return false;
+    if (this._readRecordRef(record, EXCAL_SOURCE_FIELD_ID)) return true;
+    if (this._drawingRecordCache.get(record.guid)) return true;
+    try {
+      const raw = localStorage.getItem(this._localDrawKey(record.guid));
+      if (raw && String(raw).trim()) return true;
+    } catch (_) {}
+    return false;
+  }
+
+  async _noteHasDrawing(record) {
+    if (!record?.guid) return false;
+    if (this._noteHasDrawingHint(record)) return true;
+    const coll = await this._ensureDrawingsCollection();
+    if (!coll) return false;
+    const hit = await this._findDrawingRecordBySourceGuid(coll, record.guid, record.getName?.());
+    return !!hit;
+  }
+
+  _isDrawingBackendRecord(record) {
+    if (!record?.guid) return false;
+    let coll = null;
+    try {
+      coll = record.getCollection?.() || null;
+    } catch (_) {}
+    if (coll && this._collectionLooksLikeDrawings(coll)) return true;
+    if (this._readRecordTextField(record, EXCAL_FIELD_SCENE)) return true;
+    const nm = String(record.getName?.() || '').trim();
+    return nm.includes('Excalidrawing');
+  }
+
+  async _sourceGuidForDrawingRecord(drawingRecord) {
+    const direct = this._sourceGuidFromDrawingRecord(drawingRecord);
+    if (direct) return direct;
+    const dg = drawingRecord?.guid;
+    if (!dg) return '';
+    for (const [srcGuid, dr] of this._drawingRecordCache.entries()) {
+      if (dr?.guid === dg) return srcGuid;
+    }
+    const coll = await this._ensureDrawingsCollection();
+    if (!coll) return '';
+    try {
+      const all = await coll.getAllRecords();
+      for (const r of all || []) {
+        if (r.guid !== dg) continue;
+        const src = this._sourceGuidFromDrawingRecord(r);
+        if (src) return src;
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  _sourceGuidFromDrawingRecord(record) {
+    if (!record) return '';
+    const fromRef = this._readRecordRef(record, EXCAL_FIELD_SOURCE_NOTE);
+    if (fromRef) return fromRef;
+    return this._readRecordTextField(record, EXCAL_FIELD_SOURCE_GUID);
+  }
+
+  _mountExcalSidebarItem() {
+    if (typeof this.ui?.addSidebarItem !== 'function') return;
+    try {
+      this._excalSidebarItem = this.ui.addSidebarItem({
+        icon: EXCAL_ICON,
+        label: 'Excalidrawing',
+        tooltip: 'Open or create a drawing for the current note',
+        onClick: () => {
+          setTimeout(() => { void this._openDrawingPanel(); }, 40);
+        },
+      });
+    } catch (e) {
+      console.warn(`[${EXCAL_PLUGIN_NAME}] sidebar item`, e);
+      this._excalSidebarItem = null;
+    }
+  }
+
+  _mountExcalStatusBar() {
+    if (typeof this.ui?.addStatusBarItem !== 'function') return;
+    try {
+      this._excalStatusItem = this.ui.addStatusBarItem({
+        icon: EXCAL_ICON,
+        label: 'Excalidrawing',
+        tooltip: 'Open or create a drawing for the current note',
+        onClick: () => {
+          setTimeout(() => { void this._openDrawingPanel(); }, 40);
+        },
+      });
+    } catch (e) {
+      console.warn(`[${EXCAL_PLUGIN_NAME}] status bar`, e);
+      this._excalStatusItem = null;
+    }
+  }
+
+  async _resolveDrawingRecordGuid(record, sourceColl) {
+    if (!record?.guid) return null;
+
+    const fromProp = this._readRecordRef(record, EXCAL_SOURCE_FIELD_ID);
+    if (fromProp) return fromProp;
+
+    const drawingsColl = await this._ensureDrawingsCollection();
+    if (!drawingsColl) return null;
+
+    const recordGuid = record.guid;
+    const recordName = record.getName?.() || 'Untitled';
+    const existing = await this._findDrawingRecordBySourceGuid(drawingsColl, recordGuid, recordName);
+    if (existing?.guid) {
+      try {
+        const excProp = record.prop?.(EXCAL_SOURCE_FIELD_ID);
+        if (excProp) this._linkRecordProperty(excProp, existing.guid, EXCAL_SOURCE_FIELD_ID, record);
+      } catch (_) {}
+      return existing.guid;
+    }
+
+    if (sourceColl) {
+      const drawingsCollGuid = this._getCollectionGuid(drawingsColl);
+      if (drawingsCollGuid) await this._ensureExcalidrawingFieldOnCollection(sourceColl, drawingsCollGuid);
+    }
+
+    const emptyScene = {
+      sceneJson: JSON.stringify({
+        type: 'excalidraw',
+        version: 2,
+        source: EXCAL_PLUGIN_NAME,
+        elements: [],
+        appState: { gridSize: null },
+        files: {},
+      }),
+    };
+
+    try {
+      await this._saveDrawingDoc(recordGuid, recordName, emptyScene);
+    } catch (e) {
+      console.warn(`[${EXCAL_PLUGIN_NAME}] ensure drawing record`, e);
+      return null;
+    }
+
+    const created = await this._findDrawingRecordBySourceGuid(drawingsColl, recordGuid, recordName);
+    return created?.guid || this._readRecordRef(record, EXCAL_SOURCE_FIELD_ID) || null;
   }
 
   async _openDrawingPanel() {
@@ -3572,20 +3867,150 @@ class Plugin extends AppPlugin {
     if (!record?.guid) {
       this.ui.addToaster?.({
         title: EXCAL_PLUGIN_NAME,
-        message: 'Open a note first, then run this command again.',
+        message: 'Open a note first, then try Excalidrawing again.',
         dismissible: true,
         autoDestroyTime: 4500,
       });
       return;
     }
 
+    if (this._isDrawingBackendRecord(record)) {
+      const sourceGuid = await this._sourceGuidForDrawingRecord(record);
+      if (sourceGuid) {
+        await this._openDrawingFromDrawingRecord(record, this.ui.getActivePanel?.(), sourceGuid);
+        return;
+      }
+    }
+
     const sourcePanel = this.ui.getActivePanel?.();
     const sourceColl = sourcePanel?.getActiveCollection?.() || null;
-    this._panelSession = {
+    const drawingRecordGuid = await this._resolveDrawingRecordGuid(record, sourceColl);
+
+    await this._openDrawingPanelWithSession({
       recordGuid: record.guid,
       recordName: record.getName?.() || 'Untitled',
       sourceColl,
-      drawingRecordGuid: null,
+      drawingRecordGuid,
+      sourcePanel,
+    });
+  }
+
+  _schedulePanelChrome(panel) {
+    if (this._navChromeTimer) clearTimeout(this._navChromeTimer);
+    if (this._navChromeRetryTimer) clearTimeout(this._navChromeRetryTimer);
+    this._navChromeTimer = setTimeout(() => {
+      this._navChromeTimer = null;
+      void this._refreshPanelChrome(panel);
+    }, 200);
+    this._navChromeRetryTimer = setTimeout(() => {
+      this._navChromeRetryTimer = null;
+      void this._refreshPanelChrome(panel, true);
+    }, 520);
+  }
+
+  async _refreshPanelChrome(panel, isRetry) {
+    panel = panel || this.ui.getActivePanel?.();
+    if (!panel) return;
+
+    const navType = panel?.getNavigation?.()?.type || '';
+    if (navType === 'custom' || navType === 'custom_panel') return;
+
+    const record = panel?.getActiveRecord?.();
+
+    if (this._navInterceptBusy || !record) return;
+    if (!this._isDrawingBackendRecord(record)) return;
+
+    let sourceGuid = await this._sourceGuidForDrawingRecord(record);
+    if (!sourceGuid && isRetry) {
+      await this._excalSleep(250);
+      sourceGuid = await this._sourceGuidForDrawingRecord(record);
+    }
+    if (!sourceGuid) return;
+
+    this._navInterceptBusy = true;
+    try {
+      await this._openDrawingFromDrawingRecord(record, panel, sourceGuid);
+    } finally {
+      this._navInterceptBusy = false;
+    }
+  }
+
+  _findPanelShowingRecord(recordGuid, exceptPanel) {
+    const guid = String(recordGuid || '').trim();
+    if (!guid) return null;
+    let panels = [];
+    try {
+      panels = this.ui.getPanels?.() || [];
+    } catch (_) {
+      return null;
+    }
+    for (const p of panels) {
+      if (!p) continue;
+      if (exceptPanel?.getId && p.getId?.() === exceptPanel.getId()) continue;
+      const r = p.getActiveRecord?.();
+      if (r?.guid === guid) return p;
+    }
+    return null;
+  }
+
+  async _openDrawingFromDrawingRecord(drawingRecord, panel, sourceGuid) {
+    const sourceRecord = await this._resolveSourceRecord(sourceGuid);
+    if (!sourceRecord) return;
+
+    let sourceColl = null;
+    try {
+      sourceColl = sourceRecord.getCollection?.() || null;
+    } catch (_) {}
+
+    const noteAlreadyOpen = this._findPanelShowingRecord(sourceGuid, panel);
+
+    if (noteAlreadyOpen) {
+      await this._openDrawingPanelWithSession({
+        recordGuid: sourceGuid,
+        recordName: sourceRecord.getName?.() || 'Untitled',
+        sourceColl,
+        drawingRecordGuid: drawingRecord.guid,
+        sourcePanel: panel,
+        useCurrentPanel: true,
+      });
+      return;
+    }
+
+    if (panel?.navigateTo) {
+      try {
+        panel.navigateTo({
+          type: 'edit_panel',
+          rootId: sourceGuid,
+          subId: sourceColl ? this._getCollectionGuid(sourceColl) : null,
+          workspaceGuid: this.getWorkspaceGuid?.() || null,
+        });
+      } catch (e) {
+        console.warn(`[${EXCAL_PLUGIN_NAME}] navigate to source note`, e);
+      }
+    }
+
+    await this._openDrawingPanelWithSession({
+      recordGuid: sourceGuid,
+      recordName: sourceRecord.getName?.() || 'Untitled',
+      sourceColl,
+      drawingRecordGuid: drawingRecord.guid,
+      sourcePanel: panel,
+    });
+  }
+
+  async _openDrawingPanelWithSession({
+    recordGuid,
+    recordName,
+    sourceColl,
+    drawingRecordGuid,
+    sourcePanel,
+    useCurrentPanel,
+  }) {
+    this._panelSession = {
+      recordGuid,
+      recordName: recordName || 'Untitled',
+      sourceColl: sourceColl || null,
+      drawingRecordGuid: drawingRecordGuid || null,
       saveTimer: null,
       pendingScene: null,
       dirty: false,
@@ -3597,11 +4022,13 @@ class Plugin extends AppPlugin {
     };
 
     let targetPanel = sourcePanel;
-    try {
-      const created = await this.ui.createPanel?.({ afterPanel: sourcePanel || undefined });
-      if (created) targetPanel = created;
-    } catch (e) {
-      console.warn(`[${EXCAL_PLUGIN_NAME}] createPanel`, e);
+    if (!useCurrentPanel) {
+      try {
+        const created = await this.ui.createPanel?.({ afterPanel: sourcePanel || undefined });
+        if (created) targetPanel = created;
+      } catch (e) {
+        console.warn(`[${EXCAL_PLUGIN_NAME}] createPanel`, e);
+      }
     }
 
     if (!targetPanel?.navigateToCustomType) {
@@ -3614,6 +4041,11 @@ class Plugin extends AppPlugin {
       return;
     }
     targetPanel.navigateToCustomType(EXCAL_PANEL_TYPE);
+  }
+
+  _getActiveRecord() {
+    const panel = this.ui.getActivePanel?.();
+    return panel?.getActiveRecord?.() || null;
   }
 
   async _mountDrawingPanel(panel) {
@@ -3690,6 +4122,7 @@ class Plugin extends AppPlugin {
 
       const rawScene = doc?.scene || null;
       const initialData = this._buildInitialData(doc, bundle.lib);
+      this._syncStageTheme(session, initialData?.appState?.theme);
       const hasContent = this._sceneDocHasContent(doc);
 
       const { React, createRoot, Excalidraw } = bundle;
@@ -3788,7 +4221,7 @@ class Plugin extends AppPlugin {
 
     const actions = document.createElement('div');
     actions.className = 'excal-iframe-actions';
-    actions.style.cssText = `position:absolute;left:${EXCAL_FRAME_PAD + 8}px;right:${EXCAL_FRAME_PAD + 8}px;bottom:${EXCAL_FRAME_PAD + 8}px;z-index:3;padding:6px 8px;display:flex;gap:8px;align-items:center;font-size:11px;background:rgba(0,0,0,0.55);color:#fff;border-radius:8px;`;
+    actions.style.cssText = `position:absolute;left:${EXCAL_FRAME_PAD_X + 8}px;right:${EXCAL_FRAME_PAD_X + 8}px;bottom:${EXCAL_FRAME_PAD_BOTTOM + 8}px;z-index:3;padding:6px 8px;display:flex;gap:8px;align-items:center;font-size:11px;background:rgba(0,0,0,0.55);color:#fff;border-radius:8px;`;
 
     const hint = document.createElement('span');
     hint.style.opacity = '0.75';
@@ -3833,10 +4266,9 @@ class Plugin extends AppPlugin {
     }
     session.pendingScene = { shareHash };
     session.dirty = true;
-    void this._saveDrawingDoc(session.recordGuid, session.recordName, { shareHash }).then(async () => {
+    void this._saveDrawingDoc(session.recordGuid, session.recordName, { shareHash }).then(() => {
       session.dirty = false;
       this._setPanelStatus(session, 'Share link saved');
-      await this._ensureNoteMarker(session.recordGuid);
       this.ui.addToaster?.({
         title: EXCAL_PLUGIN_NAME,
         message: 'Share link saved to this note.',
@@ -3874,7 +4306,11 @@ class Plugin extends AppPlugin {
   _serializeScene(lib, elements, appState, files) {
     if (lib?.serializeAsJSON) {
       try {
-        const sceneJson = lib.serializeAsJSON(elements, appState, files || {}, 'local');
+        // serializeAsJSON('local') uses export filters — theme is stripped (export:false).
+        const sceneJson = this._patchSceneJsonForStorage(
+          lib.serializeAsJSON(elements, appState, files || {}, 'local'),
+          appState,
+        );
         return { sceneJson };
       } catch (e) {
         console.warn(`[${EXCAL_PLUGIN_NAME}] serializeAsJSON`, e);
@@ -3899,9 +4335,11 @@ class Plugin extends AppPlugin {
       try {
         const parsed = typeof doc.sceneJson === 'string' ? JSON.parse(doc.sceneJson) : doc.sceneJson;
         const restored = restore(parsed, null, null);
+        const appState = restored?.appState || {};
+        const theme = this._excalThemeValue(appState.theme);
         return {
           elements: restored?.elements || [],
-          appState: restored?.appState || {},
+          appState: theme ? { ...appState, theme } : appState,
           files: restored?.files || {},
           scrollToContent: true,
         };
@@ -3911,9 +4349,14 @@ class Plugin extends AppPlugin {
     }
 
     const scene = doc.scene;
-    if (!scene?.elements?.length) return null;
+    if (!scene) return null;
 
-    let elements = scene.elements;
+    const hasElements = (scene.elements || []).some((x) => x && !x.isDeleted);
+    const hasFiles = scene.files && Object.keys(scene.files).length > 0;
+    const hasAppState = scene.appState && Object.keys(scene.appState).length > 0;
+    if (!hasElements && !hasFiles && !hasAppState) return null;
+
+    let elements = scene.elements || [];
     let appState = scene.appState || {};
     if (restoreElements) {
       try {
@@ -3957,56 +4400,10 @@ class Plugin extends AppPlugin {
     return tb > ta ? b : a;
   }
 
-  async _ensureNoteMarker(recordGuid) {
-    let record = null;
-    try {
-      record = this.data?.getRecord?.(recordGuid);
-    } catch (_) {}
-    if (!record && this.ui?.getActivePanel) {
-      const active = this.ui.getActivePanel()?.getActiveRecord?.();
-      if (active?.guid === recordGuid) record = active;
-    }
-    if (!record?.createLineItem) return;
-
-    try {
-      const items = await record.getLineItems(false);
-      for (const item of items || []) {
-        let props = item.props || null;
-        if (!props && item.getMetaProperties) {
-          try { props = await item.getMetaProperties(); } catch (_) {}
-        }
-        if (props && props[EXCAL_MARKER_META] === recordGuid) return;
-      }
-
-      const roots = (items || []).filter((x) => !x.parent);
-      const lastRoot = roots.length ? roots[roots.length - 1] : null;
-
-      const hr1 = await record.createLineItem(null, lastRoot, 'text');
-      if (hr1?.setSegments) await hr1.setSegments([{ type: 'text', text: '---' }]);
-
-      const marker = await record.createLineItem(null, hr1 || lastRoot, 'text');
-      if (marker?.setMetaProperties) {
-        await marker.setMetaProperties({ [EXCAL_MARKER_META]: recordGuid });
-      }
-      if (marker?.setSegments) {
-        await marker.setSegments([
-          {
-            type: 'text',
-            text: '📝 Excalidraw sketch saved — Command Palette → "Excalidraw: Open drawing for this note"',
-          },
-        ]);
-      }
-
-      const hr2 = await record.createLineItem(null, marker, 'text');
-      if (hr2?.setSegments) await hr2.setSegments([{ type: 'text', text: '---' }]);
-    } catch (e) {
-      console.warn(`[${EXCAL_PLUGIN_NAME}] note marker`, e);
-    }
-  }
-
   _pickAppState(appState) {
     if (!appState || typeof appState !== 'object') return {};
     return {
+      theme: appState.theme,
       viewBackgroundColor: appState.viewBackgroundColor,
       gridSize: appState.gridSize,
       scrollX: appState.scrollX,
@@ -4300,10 +4697,6 @@ class Plugin extends AppPlugin {
     try {
       localStorage.setItem(this._localDrawKey(recordGuid), JSON.stringify(doc));
     } catch (_) {}
-
-    if (this._sceneDocHasContent(doc)) {
-      await this._ensureNoteMarker(recordGuid);
-    }
   }
 
   async _flushPanelSession(force) {
@@ -4314,11 +4707,12 @@ class Plugin extends AppPlugin {
     if (session.saveInFlight) return;
 
     session.saveInFlight = true;
+    this._setPanelStatus(session, 'Saving…');
     try {
       if (session.pendingScene) {
         await this._saveDrawingDoc(session.recordGuid, session.recordName, session.pendingScene);
         session.dirty = false;
-        this._setPanelStatus(session, 'Saved');
+        this._setPanelStatus(session, 'Changes saved');
       }
     } catch (e) {
       console.error(`[${EXCAL_PLUGIN_NAME}] save`, e);
