@@ -2,6 +2,7 @@
   "name": "Excalidraw",
   "icon": "ti-palette",
   "description": "Open a synced Excalidraw sketch for the active note in a side panel. Drawings live in the Excalidrawings collection with bidirectional note links.",
+  "version": "0.3.0",
   "custom": {
     "cdnVersion": "0.17.6",
     "autosaveMs": 1500

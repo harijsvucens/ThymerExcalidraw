@@ -1,0 +1,17 @@
+{
+  "name": "thymer-excalidraw",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Thymer global plugin: per-note Excalidraw sketches in a side panel",
+  "type": "module",
+  "scripts": {
+    "build:quick": "node dev.js --once",
+    "dev": "node dev.js",
+    "push": "node dev.js --once && echo 'Push complete — paste plugin.js into Thymer'"
+  },
+  "devDependencies": {
+    "chokidar": "^4.0.3",
+    "chrome-remote-interface": "^0.33.3",
+    "esbuild": "^0.25.3"
+  }
+}
