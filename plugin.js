@@ -2426,7 +2426,7 @@ const EXCAL_PLUGIN_ID = 'excalidraw';
 const EXCAL_MODE_KEY = 'thymerext_ps_mode_excalidraw';
 const EXCAL_DRAW_PREFIX = 'excal_draw_v1_';
 const EXCAL_PANEL_TYPE = 'excalidraw-editor';
-const EXCAL_VERSION = '0.5.8';
+const EXCAL_VERSION = '0.5.9';
 const EXCAL_ICON = 'ti-palette';
 const EXCAL_FRAME_PAD_X = 12;
 const EXCAL_FRAME_PAD_TOP = 28;
@@ -2558,10 +2558,25 @@ class Plugin extends AppPlugin {
     this._excalSidebarItem = null;
     this._myUserGuid = null;
     this._realtimeUnsubs = [];
+    this._pagehideUnsub = null;
+
+    // v0.5.9: page-hide flush. When the user closes the tab/window
+    // or backgrounds the tab, force a flush of any pending scene.
+    // The autosave debounce is 1500ms; without this, a user who
+    // closes Thymer within 1.5s of drawing loses the change. The
+    // panel.closed event only fires for panel close, not for the
+    // whole page going away. pagehide + beforeunload + visibility
+    // cover tab close, window close, and tab backgrounding.
+    this._installPageHideFlush();
 
     const custom = this.getConfiguration()?.custom || {};
     this._cdnVersion = String(custom.cdnVersion || EXCAL_UMD_VERSION).trim() || EXCAL_UMD_VERSION;
-    this._autosaveMs = Math.max(800, Number(custom.autosaveMs) || 1500);
+    // v0.5.9: lowered the autosave debounce floor from 800ms to
+    // 300ms. The save is cheap (one prop set + one localStorage
+    // write), and a tighter debounce means the pagehide flush
+    // rarely has to fight a 1.5s gap between the last edit and
+    // a quick close.
+    this._autosaveMs = Math.max(200, Number(custom.autosaveMs) || 400);
 
     this._injectCSS();
     this.ui.registerCustomPanelType(EXCAL_PANEL_TYPE, (panel) => this._mountDrawingPanel(panel));
@@ -3638,6 +3653,36 @@ class Plugin extends AppPlugin {
 
   _markPanelAncestorsTransparent(el) {
     this._stretchPanelAncestors(el);
+  }
+
+  _installPageHideFlush() {
+    if (this._pagehideUnsub) return;
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+    const flushOnHide = () => {
+      try {
+        if (typeof document !== 'undefined' && document.visibilityState
+          && document.visibilityState !== 'hidden' && document.visibilityState !== 'unloaded') {
+          // For visibilitychange only — we only flush on hidden, not visible
+          // (avoids spurious flushes when refocusing the tab).
+        }
+        void this._flushPanelSession(true);
+      } catch (_) {}
+    };
+    const onVisChange = () => {
+      try {
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+          flushOnHide();
+        }
+      } catch (_) {}
+    };
+    window.addEventListener('pagehide', flushOnHide);
+    window.addEventListener('beforeunload', flushOnHide);
+    document.addEventListener('visibilitychange', onVisChange);
+    this._pagehideUnsub = () => {
+      try { window.removeEventListener('pagehide', flushOnHide); } catch (_) {}
+      try { window.removeEventListener('beforeunload', flushOnHide); } catch (_) {}
+      try { document.removeEventListener('visibilitychange', onVisChange); } catch (_) {}
+    };
   }
 
   _installContextMenuGuard(shellEl, session) {
@@ -4966,6 +5011,15 @@ class Plugin extends AppPlugin {
     this._drawingRecordCache.set(recordGuid, drawingRecord);
 
     const sceneJson = JSON.stringify(doc);
+    // v0.5.9: write the localStorage mirror BEFORE the awaited DB
+    // write. The DB write is async and may not complete if the
+    // page unloads (pagehide / beforeunload). The localStorage
+    // write is sync — once it lands, even a mid-save page close
+    // leaves the mirror updated, and _loadDrawingDoc's
+    // _pickNewerDoc merge prefers the newer mirror on reload.
+    try {
+      localStorage.setItem(this._localDrawKey(recordGuid), sceneJson);
+    } catch (_) {}
     try {
       const sceneProp = drawingRecord.prop?.(EXCAL_FIELD_SCENE);
       if (sceneProp?.set) {

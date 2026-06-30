@@ -1,5 +1,61 @@
 # ThymerExcalidraw Changelog
 
+## 0.5.9 — 2026-06-30
+
+### Fixed (close-Tymer-quickly loses unsaved changes)
+
+- **Page-hide flush.** The autosave debounce was 1.5s. If the user
+  closed Thymer within 1.5s of drawing, the change was in
+  `pendingScene` only — never reached the DB, never reached
+  localStorage. On reopen the canvas came back blank. Symptom:
+  "draw, close, reopen → blank" with quick close, but a normal wait
+  worked.
+  - Added `_installPageHideFlush()` in `onLoad()` (plugin.js:3653).
+    Installs `pagehide`, `beforeunload`, and `visibilitychange` (on
+    `hidden` only) listeners that call `_flushPanelSession(true)`.
+  - The `panel.closed` event only fires for the panel close, not for
+    the whole page/app going away — these new listeners cover tab
+    close, window close, and tab backgrounding.
+  - The flush is idempotent: `_flushPanelSession` has a
+    `saveInFlight` re-entrancy guard, so overlapping pagehide /
+    beforeunload / visibilitychange fires are no-ops.
+- **localStorage write moved before the DB write in
+  `_saveDrawingDoc` (plugin.js:5008).** The DB write is `await`ed
+  and may not complete if the page unloads mid-save. The
+  localStorage mirror write is sync — by doing it FIRST, even a
+  mid-save page close leaves the mirror updated. `_loadDrawingDoc`'s
+  `_pickNewerDoc` merge already prefers the newer mirror on reload,
+  so this closes the gap for the DB write that didn't land.
+- **Autosave debounce floor lowered** from 800ms to 200ms, default
+  from 1500ms to 400ms (plugin.json `custom.autosaveMs`, plugin.js
+  `_autosaveMs` init at line 2579). The save is cheap (one prop set
+  + one localStorage write); 400ms is short enough that the pagehide
+  flush rarely has to fight a long gap, and short enough that "wait
+  for Changes saved" feels snappy.
+
+### Diagnostic
+
+- Bumped `EXCAL_VERSION` to `0.5.9` and `plugin.json` version to
+  `0.5.9`. The canary `EXCAL_VERSION` line in the page console now
+  distinguishes v0.5.9 from earlier builds.
+
+### Live verification (Playwright, Chrome Dev Test profile)
+
+- `tests/sync/T9-close-reopen.mjs`:
+  - **Phase 1 + 2 (wait-for-autosave round-trip):** drew 1 freedraw
+    on "Notes" record (`1J9YG6E4KYZ9JRATQ9SM0479AT`), waited 2.5s for
+    autosave, opened a fresh page, opened the same Excalidraw panel.
+    In-memory count matched (2 == 2). Pre-v0.5.9 same flow had
+    `phase1_afterMem_count > phase2_reopen_count` when the user
+    closed too fast. Post-v0.5.9: `pass: true`.
+  - **Phase 3 (quick-close regression test, NEW):** drew 1 freedraw,
+    called `page.close()` IMMEDIATELY without waiting for the
+    autosave debounce, opened a fresh page. Post-v0.5.9: the
+    new freedraw was preserved (`beforeQuickCount: 2 →
+    afterQuickCount: 3`). The pagehide listener force-flushed the
+    pending scene before the page unloads. Pre-v0.5.9 same flow
+    lost the change.
+
 ## 0.5.8 — 2026-06-30
 
 ### Fixed (fresh-load shows blank canvas — root cause)
