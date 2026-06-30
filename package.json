@@ -7,11 +7,14 @@
   "scripts": {
     "build:quick": "node dev.js --once",
     "dev": "node dev.js",
-    "push": "node dev.js --once && echo 'Push complete — paste plugin.js into Thymer'"
+    "deploy": "node scripts/deploy-plugin.mjs",
+    "deploy:preview": "node scripts/deploy-plugin.mjs --preview-only",
+    "push": "node scripts/deploy-plugin.mjs"
   },
   "devDependencies": {
     "chokidar": "^4.0.3",
     "chrome-remote-interface": "^0.33.3",
-    "esbuild": "^0.25.3"
+    "esbuild": "^0.25.3",
+    "playwright-core": "^1.61.1"
   }
 }

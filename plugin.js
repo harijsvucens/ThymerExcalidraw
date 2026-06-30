@@ -2426,7 +2426,7 @@ const EXCAL_PLUGIN_ID = 'excalidraw';
 const EXCAL_MODE_KEY = 'thymerext_ps_mode_excalidraw';
 const EXCAL_DRAW_PREFIX = 'excal_draw_v1_';
 const EXCAL_PANEL_TYPE = 'excalidraw-editor';
-const EXCAL_VERSION = '0.3.0';
+const EXCAL_VERSION = '0.5.8';
 const EXCAL_ICON = 'ti-palette';
 const EXCAL_FRAME_PAD_X = 12;
 const EXCAL_FRAME_PAD_TOP = 28;
@@ -2448,6 +2448,36 @@ const EXCAL_FIELD_SOURCE_NOTE = 'source_note';
 const EXCAL_FIELD_SOURCE_GUID = 'source_record_guid';
 const EXCAL_SOURCE_FIELD_ID = 'excalidrawing';
 const EXCAL_SOURCE_FIELD_LABEL = 'Excalidrawing';
+const EXCAL_WS_THROTTLE_MS = 80;
+const EXCAL_WS_MSG_TYPE = 'excal-delta';
+const EXCAL_ECHO_GUARD_MS = 500;
+
+// Returns true if the element has no rendered extent yet — i.e. the user
+// is mid-drag (pointer-down without pointer-up) and any snapshot we
+// persist/broadcast would be invisible. Excalidraw finalizes the
+// dimensions on pointer-up, so dropping these in-flight elements is safe:
+// the next onChange will carry the finalized version.
+function isDegenerateElement(el) {
+  if (!el || el.isDeleted) return true;
+  // Freedraw: a single point is the initial pointer-down state.
+  if (el.type === 'freedraw') {
+    if (!Array.isArray(el.points) || el.points.length < 2) return true;
+    const w = Math.abs(el.width || 0);
+    const h = Math.abs(el.height || 0);
+    if (w < 1 && h < 1) return true;
+    return false;
+  }
+  // Shapes (rectangle / ellipse / diamond / line / arrow) report width/height
+  // of 0 only between pointer-down and pointer-up. Threshold of 1 px is
+  // well below any human-drawn shape.
+  if (el.type === 'rectangle' || el.type === 'ellipse' || el.type === 'diamond'
+      || el.type === 'line' || el.type === 'arrow') {
+    const w = Math.abs(el.width || 0);
+    const h = Math.abs(el.height || 0);
+    if (w < 1 && h < 1) return true;
+  }
+  return false;
+}
 
 function excalDrawingsCollectionShape() {
   return {
@@ -2488,7 +2518,25 @@ function excalDrawingsCollectionShape() {
     custom: {
       [EXCAL_DRAWINGS_COLL_MARKER]: true,
       plugin_id: EXCAL_PLUGIN_ID,
+      first_seen_at_ms: Date.now(),
     },
+  };
+}
+
+// v0.5.6: shallow-clone an element for use as a delta-filter snapshot.
+// Excalidraw mutates element objects in place; storing the live reference
+// causes the delta filter to always see prevEl.version === el.version
+// (same object) and emit an empty delta. Cloning the array-valued fields
+// (points, boundElements, groupIds) and the containerId reference fully
+// decouples the snapshot from the live element.
+function _cloneElementSnapshot(el) {
+  if (!el) return el;
+  return {
+    ...el,
+    points: Array.isArray(el.points) ? el.points.slice() : el.points,
+    boundElements: Array.isArray(el.boundElements) ? el.boundElements.slice() : el.boundElements,
+    groupIds: Array.isArray(el.groupIds) ? el.groupIds.slice() : el.groupIds,
+    containerId: el.containerId ?? null,
   };
 }
 
@@ -2496,6 +2544,7 @@ class Plugin extends AppPlugin {
   onLoad() {
     if (typeof super.onLoad === 'function') super.onLoad();
 
+    this._instanceTag = `excal-i${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     this._version = EXCAL_VERSION;
     this._eventIds = [];
     this._panelSession = null;
@@ -2507,6 +2556,8 @@ class Plugin extends AppPlugin {
     this._navInterceptBusy = false;
     this._excalStatusItem = null;
     this._excalSidebarItem = null;
+    this._myUserGuid = null;
+    this._realtimeUnsubs = [];
 
     const custom = this.getConfiguration()?.custom || {};
     this._cdnVersion = String(custom.cdnVersion || EXCAL_UMD_VERSION).trim() || EXCAL_UMD_VERSION;
@@ -2540,6 +2591,7 @@ class Plugin extends AppPlugin {
         const closedId = ev?.panel?.getId?.();
         if (session?.panelId && closedId && session.panelId !== closedId) return;
         try { session?._resizeObs?.disconnect?.(); } catch (_) {}
+        this._teardownRealtimeListeners(session);
         void this._flushPanelSession(true);
         try { session?.reactRoot?.unmount?.(); } catch (_) {}
         if (session && (!closedId || session.panelId === closedId)) {
@@ -2550,7 +2602,11 @@ class Plugin extends AppPlugin {
       console.warn(`[${EXCAL_PLUGIN_NAME}] events API unavailable — property intercept and status bar sync disabled`);
     }
 
-    void this._bootDrawingsCollection();
+    void this._bootDrawingsCollection().then((coll) => {
+      if (typeof globalThis !== 'undefined' && globalThis.__excalDebug) {
+        globalThis.__excalDebug.bootCollectionGuid = coll ? this._getCollectionGuid(coll) : null;
+      }
+    });
     setTimeout(() => this._schedulePanelChrome(this.ui.getActivePanel?.()), 600);
   }
 
@@ -2559,6 +2615,11 @@ class Plugin extends AppPlugin {
       try { this.events.off(id); } catch (_) {}
     }
     this._eventIds = [];
+    this._teardownRealtimeListeners(this._panelSession);
+    for (const unsub of this._realtimeUnsubs || []) {
+      try { unsub(); } catch (_) {}
+    }
+    this._realtimeUnsubs = [];
     void this._flushPanelSession(true);
     this._panelSession = null;
     this._drawingRecordCache?.clear?.();
@@ -2629,6 +2690,15 @@ class Plugin extends AppPlugin {
     return false;
   }
 
+  _getCollectionCreatedAt(coll) {
+    if (!coll) return Number.MAX_SAFE_INTEGER;
+    try {
+      const ts = coll.getConfiguration?.()?.custom?.first_seen_at_ms;
+      if (typeof ts === 'number') return ts;
+    } catch (_) {}
+    return Number.MAX_SAFE_INTEGER;
+  }
+
   _collectionLooksLikeDrawings(coll) {
     if (!coll) return false;
     if (this._collectionHasDrawingsMarker(coll)) return true;
@@ -2649,19 +2719,39 @@ class Plugin extends AppPlugin {
 
   _pickCanonicalDrawingsCollection(candidates) {
     if (!Array.isArray(candidates) || !candidates.length) return null;
-    const stored = this._getStoredDrawingsCollGuid();
-    if (stored) {
-      const hit = candidates.find((c) => this._getCollectionGuid(c) === stored);
-      if (hit) return hit;
+    const marked = candidates.filter((c) => this._collectionHasDrawingsMarker(c));
+    if (marked.length) {
+      // Among marked candidates, prefer the OLDEST (canonical was created
+      // first; dupes from hot-reload races are always later). Stored GUID
+      // is intentionally NOT used here — if the stored points to a dupe
+      // (perpetuating the dupe race), we want to break the chain and
+      // adopt the real canonical. The stored GUID is set as a side-effect
+      // of adoptDrawingsCollection, so it gets corrected on the next boot.
+      const sorted = marked.slice().sort((a, b) => this._getCollectionCreatedAt(a) - this._getCollectionCreatedAt(b));
+      const picked = sorted[0];
+      if (marked.length > 1) {
+        const guids = marked.map((c) => this._getCollectionGuid(c) || '?').join(', ');
+        console.log(`[${EXCAL_PLUGIN_NAME}] [${this._instanceTag}] ${marked.length} marked drawings collections — picked oldest (${this._getCollectionGuid(picked)}) from: [${guids}]`);
+        try {
+          if (typeof globalThis !== 'undefined' && globalThis.__excalDebug !== undefined) {
+            globalThis.__excalDebug.duplicateDrawingsCollections = marked.map((c) => this._getCollectionGuid(c));
+          }
+        } catch (_) {}
+      }
+      return picked;
     }
-    const marked = candidates.find((c) => this._collectionHasDrawingsMarker(c));
-    if (marked) return marked;
     const exact = candidates.find((c) => this._collectionDisplayName(c) === EXCAL_DRAWINGS_COLL_NAME);
     if (exact) return exact;
     if (candidates.length > 1) {
+      const guids = candidates.map((c) => this._getCollectionGuid(c) || '?').join(', ');
       console.warn(
-        `[${EXCAL_PLUGIN_NAME}] ${candidates.length} "${EXCAL_DRAWINGS_COLL_NAME}" collections found — using one; delete extras in Thymer sidebar`,
+        `[${EXCAL_PLUGIN_NAME}] ${candidates.length} "${EXCAL_DRAWINGS_COLL_NAME}" collections found (no markers) — using first; delete extras in Thymer sidebar. GUIDs: [${guids}]`,
       );
+      try {
+        if (typeof globalThis !== 'undefined' && globalThis.__excalDebug !== undefined) {
+          globalThis.__excalDebug.duplicateDrawingsCollections = candidates.map((c) => this._getCollectionGuid(c));
+        }
+      } catch (_) {}
     }
     return candidates[0];
   }
@@ -2781,6 +2871,7 @@ class Plugin extends AppPlugin {
     if (!coll) return null;
     const g = this._getCollectionGuid(coll);
     if (g) this._setStoredDrawingsCollGuid(g);
+    this._drawingsCollectionRef = coll;
     await this._mergeDrawingsCollectionSchema(coll);
     return coll;
   }
@@ -2840,6 +2931,30 @@ class Plugin extends AppPlugin {
       custom.plugin_id = EXCAL_PLUGIN_ID;
       changed = true;
     }
+    if (typeof custom.first_seen_at_ms !== 'number') {
+      // Backfill: derive a stable age signal from the collection's records.
+      // The earliest record's created timestamp is a reliable proxy for
+      // "this collection was created first" (dupes are always newer than
+      // the canonical they were cloned from). When multiple collections
+      // exist and the plugin has to pick the canonical, this signal
+      // disambiguates them — Date.now() on both would be a coin flip.
+      let derivedTs = Date.now();
+      try {
+        const records = await coll.getAllRecords?.();
+        if (Array.isArray(records) && records.length) {
+          let earliest = Infinity;
+          for (const r of records) {
+            const c = Number(r?.created);
+            if (Number.isFinite(c) && c > 0 && c < earliest) earliest = c;
+          }
+          if (Number.isFinite(earliest) && earliest < derivedTs) {
+            derivedTs = Math.floor(earliest * 1000);
+          }
+        }
+      } catch (_) { /* keep Date.now() fallback */ }
+      custom.first_seen_at_ms = derivedTs;
+      changed = true;
+    }
     const wantIcon = desired.icon || EXCAL_ICON;
     if (base.icon !== wantIcon) changed = true;
     if (!changed) return;
@@ -2863,9 +2978,21 @@ class Plugin extends AppPlugin {
     const data = this.data;
     if (!data || typeof data.createCollection !== 'function') return null;
     try {
+      const existing = await this._discoverDrawingsCollection();
+      if (existing) return existing;
+    } catch (_) {}
+    try {
       const raw = data.createCollection();
       const coll = raw != null && typeof raw.then === 'function' ? await raw : raw;
       if (coll && typeof coll.getConfiguration === 'function' && typeof coll.saveConfiguration === 'function') {
+        const winner = await this._discoverDrawingsCollection();
+        if (winner && winner !== coll && this._collectionLooksLikeDrawings(winner)) {
+          console.error(`[${EXCAL_PLUGIN_NAME}] ORPHAN CREATED: ${this._getCollectionGuid(coll) || '?'} is an orphan (canonical is ${this._getCollectionGuid(winner) || '?'}). The plugin cannot delete collections — trash the orphan in the Thymer sidebar.`);
+          if (typeof globalThis !== 'undefined' && globalThis.__excalDebug !== undefined) {
+            globalThis.__excalDebug.lastOrphanDrawingsCollection = this._getCollectionGuid(coll);
+          }
+          return winner;
+        }
         return coll;
       }
     } catch (e) {
@@ -2876,20 +3003,45 @@ class Plugin extends AppPlugin {
 
   async _ensureDrawingsCollectionCore() {
     const stored = this._getStoredDrawingsCollGuid();
-    if (stored && typeof this.data.getCollection === 'function') {
-      try {
-        const c = await this.data.getCollection(stored);
-        if (c) return await this._adoptDrawingsCollection(c);
-      } catch (_) {}
+    console.log(`[${EXCAL_PLUGIN_NAME}] [${this._instanceTag}] DIAG ensure start: storedGuid=${stored || '(empty)'} data.getCollection=${typeof this.data.getCollection} data.getAllCollections=${typeof this.data.getAllCollections}`);
+    if (stored) {
+      // data.getCollection does NOT exist on the SDK — use getAllCollections
+      // and filter by GUID. Retry to handle workspace blindness (browser
+      // reload after preview_plugin can leave the workspace blind for 10s+;
+      // 2.5s was insufficient and produced dupes on every reload).
+      let c = null;
+      for (let i = 0; i < 30; i++) {
+        try {
+          const all = await this.data.getAllCollections();
+          c = (Array.isArray(all) ? all : []).find((x) => this._getCollectionGuid(x) === stored) || null;
+        } catch (e) { c = null; }
+        if (c) {
+          console.log(`[${EXCAL_PLUGIN_NAME}] [${this._instanceTag}] DIAG getAllCollections→stored=${stored} attempt ${i + 1}/30 → FOUND`);
+          break;
+        }
+        if (i === 0 || i === 4 || i === 9 || i === 19 || i === 29) {
+          console.log(`[${EXCAL_PLUGIN_NAME}] [${this._instanceTag}] DIAG getAllCollections→stored=${stored} attempt ${i + 1}/30 → null`);
+        }
+        if (i < 29) await this._excalSleep(150 + i * 100);
+      }
+      if (c) return await this._adoptDrawingsCollection(c);
+      console.log(`[${EXCAL_PLUGIN_NAME}] [${this._instanceTag}] DIAG getAllCollections→stored=${stored} exhausted (30 attempts, ~15s) — stale/invalid, clearing cache`);
       try {
         localStorage.removeItem(this._drawingsCollGuidLsKey());
       } catch (_) {}
+      // Stored GUID is unreachable — fall through to discover.
     }
 
-    for (let attempt = 0; attempt < 4; attempt++) {
+    for (let attempt = 0; attempt < 8; attempt++) {
       const existing = await this._discoverDrawingsCollection();
-      if (existing) return await this._adoptDrawingsCollection(existing);
-      if (attempt < 3) await this._excalSleep(60 + attempt * 40);
+      if (existing) {
+        console.log(`[${EXCAL_PLUGIN_NAME}] [${this._instanceTag}] DIAG pre-lease discover attempt ${attempt + 1}/8 → ${this._getCollectionGuid(existing)} (FOUND)`);
+        return await this._adoptDrawingsCollection(existing);
+      }
+      if (attempt === 0 || attempt === 3 || attempt === 7) {
+        console.log(`[${EXCAL_PLUGIN_NAME}] [${this._instanceTag}] DIAG pre-lease discover attempt ${attempt + 1}/8 → null`);
+      }
+      if (attempt < 7) await this._excalSleep(200 + attempt * 100);
     }
 
     const attemptAge = this._getDrawingsCreateAttemptAgeMs();
@@ -2912,8 +3064,19 @@ class Plugin extends AppPlugin {
     try {
       this._markDrawingsCreateAttempt();
 
-      let existing = await this._discoverDrawingsCollection();
+      // Post-lease multi-attempt discover. After the lease is acquired,
+      // another tab/instance may have just created the canonical and the
+      // workspace getAllCollections() can briefly return stale data. Retry
+      // with backoff to give it time to settle before we create a dupe.
+      let existing = null;
+      for (let i = 0; i < 6; i++) {
+        existing = await this._discoverDrawingsCollection();
+        console.log(`[${EXCAL_PLUGIN_NAME}] [${this._instanceTag}] DIAG post-lease discover attempt ${i + 1}/6 → ${existing ? this._getCollectionGuid(existing) : 'null'}`);
+        if (existing) break;
+        if (i < 5) await this._excalSleep(120 + i * 80);
+      }
       if (existing) return await this._adoptDrawingsCollection(existing);
+      console.log(`[${EXCAL_PLUGIN_NAME}] [${this._instanceTag}] DIAG post-lease discover exhausted — proceeding to create`);
 
       if (typeof this.data.createCollection !== 'function') return null;
 
@@ -2959,6 +3122,7 @@ class Plugin extends AppPlugin {
 
   async _ensureDrawingsCollection() {
     if (!this.data || typeof this.data.getAllCollections !== 'function') return null;
+    if (this._drawingsCollectionRef) return this._drawingsCollectionRef;
     const host = this._excalSharedWin();
     const gKey = `${EXCAL_DRAWINGS_ENSURE_GLOBAL_P}_${this._wsSlug()}`;
     if (host[gKey] && typeof host[gKey].then === 'function') return host[gKey];
@@ -2983,6 +3147,17 @@ class Plugin extends AppPlugin {
       if (!coll) {
         console.warn(`[${EXCAL_PLUGIN_NAME}] ${EXCAL_DRAWINGS_COLL_NAME} collection not available yet`);
       }
+      try {
+        const all = await this._listCollectionsWithRetry(5);
+        const dupes = this._findDrawingsCollectionsInList(all);
+        if (dupes.length > 1) {
+          const guids = dupes.map((c) => this._getCollectionGuid(c) || '?').join(', ');
+          console.warn(`[${EXCAL_PLUGIN_NAME}] ${dupes.length} "${EXCAL_DRAWINGS_COLL_NAME}" collections found at boot — delete extras in Thymer sidebar. GUIDs: [${guids}]`);
+          if (typeof globalThis !== 'undefined' && globalThis.__excalDebug !== undefined) {
+            globalThis.__excalDebug.duplicateDrawingsCollections = dupes.map((c) => this._getCollectionGuid(c));
+          }
+        }
+      } catch (_) {}
     } catch (e) {
       console.error(`[${EXCAL_PLUGIN_NAME}] boot drawings collection`, e);
     }
@@ -3135,55 +3310,91 @@ class Plugin extends AppPlugin {
   }
 
   async _findDrawingRecordBySourceGuid(drawingsColl, sourceGuid, noteTitle) {
-    if (!drawingsColl || !sourceGuid) return null;
+    if (!sourceGuid) return null;
     if (this._drawingRecordCache.has(sourceGuid)) {
-      return this._drawingRecordCache.get(sourceGuid) || null;
+      const cached = this._drawingRecordCache.get(sourceGuid);
+      if (cached) return cached;
     }
 
     const session = this._panelSession;
     if (session?.drawingRecordGuid && session.recordGuid === sourceGuid) {
       try {
-        const all = await drawingsColl.getAllRecords();
-        const pinned = (all || []).find((x) => x.guid === session.drawingRecordGuid);
-        if (pinned) {
-          this._drawingRecordCache.set(sourceGuid, pinned);
-          return pinned;
+        const colls = await this._getAllDrawingsCollections();
+        for (const coll of colls) {
+          try {
+            const all = await coll.getAllRecords();
+            const pinned = (all || []).find((x) => x.guid === session.drawingRecordGuid);
+            if (pinned) {
+              this._drawingRecordCache.set(sourceGuid, pinned);
+              return pinned;
+            }
+          } catch (_) {}
         }
       } catch (_) {}
     }
 
-    let records = [];
+    const colls = drawingsColl ? [drawingsColl] : [];
     try {
-      records = await drawingsColl.getAllRecords();
-    } catch (e) {
-      console.warn(`[${EXCAL_PLUGIN_NAME}] getAllRecords`, e);
-      return null;
-    }
+      const all = await this._getAllDrawingsCollections();
+      for (const c of all) {
+        if (!colls.find((x) => this._getCollectionGuid(x) === this._getCollectionGuid(c))) {
+          colls.push(c);
+        }
+      }
+    } catch (_) {}
 
     const titleNeedle = noteTitle ? this._drawingTitleForNote(noteTitle) : '';
     const matches = [];
+    let totalScanned = 0;
 
-    for (const r of records || []) {
-      let matched = false;
+    for (const coll of colls) {
+      let records = [];
       try {
-        const ref = r.reference?.(EXCAL_FIELD_SOURCE_NOTE);
-        if (ref && String(ref).trim() === sourceGuid) matched = true;
-      } catch (_) {}
-      if (!matched) {
-        const stored = this._readRecordTextField(r, EXCAL_FIELD_SOURCE_GUID);
-        if (stored === sourceGuid) matched = true;
-      }
-      if (!matched && titleNeedle) {
+        records = await coll.getAllRecords();
+      } catch (_) { continue; }
+      totalScanned += (records || []).length;
+
+      for (const r of records || []) {
+        let matched = false;
         try {
-          const nm = String(r.getName?.() || '').trim();
-          if (nm === titleNeedle) matched = true;
+          const ref = r.reference?.(EXCAL_FIELD_SOURCE_NOTE);
+          if (ref && String(ref).trim() === sourceGuid) matched = true;
         } catch (_) {}
+        if (!matched) {
+          const stored = this._readRecordTextField(r, EXCAL_FIELD_SOURCE_GUID);
+          if (stored === sourceGuid) matched = true;
+        }
+        if (!matched && titleNeedle) {
+          try {
+            const nm = String(r.getName?.() || '').trim();
+            if (nm === titleNeedle) matched = true;
+          } catch (_) {}
+        }
+        if (matched) matches.push(r);
       }
-      if (matched) matches.push(r);
     }
 
     if (!matches.length) {
+      try {
+        const srcRec = await this._resolveSourceRecord(sourceGuid);
+        if (srcRec) {
+          const directGuid = this._readRecordRef(srcRec, 'excalidrawing');
+          if (directGuid) {
+            for (const coll of colls) {
+              try {
+                const all = await coll.getAllRecords();
+                const direct = (all || []).find((x) => x.guid === directGuid);
+                if (direct) {
+                  this._drawingRecordCache.set(sourceGuid, direct);
+                  return direct;
+                }
+              } catch (_) {}
+            }
+          }
+        }
+      } catch (_) {}
       this._drawingRecordCache.set(sourceGuid, null);
+      console.warn(`[${EXCAL_PLUGIN_NAME}] _findDrawingRecordBySourceGuid: no match for sourceGuid=${sourceGuid} titleNeedle=${JSON.stringify(titleNeedle)} scanned=${totalScanned} collections=${colls.length}`);
       return null;
     }
 
@@ -3197,6 +3408,31 @@ class Plugin extends AppPlugin {
 
     this._drawingRecordCache.set(sourceGuid, best);
     return best;
+  }
+
+  async _getAllDrawingsCollections() {
+    const out = [];
+    const seen = new Set();
+    const add = (c) => {
+      if (!c) return;
+      const g = this._getCollectionGuid(c);
+      if (g) {
+        if (seen.has(g)) return;
+        seen.add(g);
+      }
+      out.push(c);
+    };
+    try {
+      const primary = await this._ensureDrawingsCollection();
+      add(primary);
+    } catch (_) {}
+    try {
+      const all = await this.data?.getAllCollections?.();
+      for (const c of all || []) {
+        if (this._collectionLooksLikeDrawings(c)) add(c);
+      }
+    } catch (_) {}
+    return out;
   }
 
   async _resolveSourceRecord(sourceGuid) {
@@ -3404,6 +3640,21 @@ class Plugin extends AppPlugin {
     this._stretchPanelAncestors(el);
   }
 
+  _installContextMenuGuard(shellEl, session) {
+    if (!shellEl || session?._contextMenuGuardInstalled) return;
+    const onContextMenu = (e) => {
+      e.stopPropagation();
+      if (e.cancelable) e.preventDefault();
+    };
+    shellEl.addEventListener('contextmenu', onContextMenu);
+    session._contextMenuGuardInstalled = true;
+    session._contextMenuGuardDispose = () => {
+      try { shellEl.removeEventListener('contextmenu', onContextMenu); } catch (_) {}
+      session._contextMenuGuardInstalled = false;
+      session._contextMenuGuardDispose = null;
+    };
+  }
+
   _excalThemeValue(theme) {
     return theme === 'dark' || theme === 'light' ? theme : null;
   }
@@ -3503,13 +3754,20 @@ class Plugin extends AppPlugin {
       },
       onChange: (elements, appState, files) => {
         plugin._syncStageTheme(session, appState?.theme);
-        session.pendingScene = plugin._serializeScene(session.excalLib, elements, appState, files);
-        session.dirty = true;
-        plugin._setPanelStatus(session, 'Unsaved changes');
-        clearTimeout(session.saveTimer);
-        session.saveTimer = setTimeout(() => {
-          void plugin._flushPanelSession(false);
-        }, plugin._autosaveMs);
+        const echoSuppressed = session.applyingRemoteUpdate || (Date.now() - (session.lastRemoteApplyMs || 0) < EXCAL_ECHO_GUARD_MS);
+        if (!echoSuppressed) {
+          session.pendingScene = plugin._serializeScene(session.excalLib, elements, appState, files);
+          session.dirty = true;
+          plugin._setPanelStatus(session, 'Unsaved changes');
+          clearTimeout(session.saveTimer);
+          session.saveTimer = setTimeout(() => {
+            void plugin._flushPanelSession(false);
+          }, plugin._autosaveMs);
+        }
+        console.log(`[${EXCAL_PLUGIN_NAME}] DIAG: onChange ${elements.length} els, applyingRemote=${session.applyingRemoteUpdate} echoSuppressed=${echoSuppressed}`);
+        if (!echoSuppressed) {
+          plugin._scheduleWsBroadcast(session, elements);
+        }
       },
     });
   }
@@ -4011,6 +4269,8 @@ class Plugin extends AppPlugin {
       recordName: recordName || 'Untitled',
       sourceColl: sourceColl || null,
       drawingRecordGuid: drawingRecordGuid || null,
+      _instanceTag: this._instanceTag,
+      senderId: `excal-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
       saveTimer: null,
       pendingScene: null,
       dirty: false,
@@ -4019,6 +4279,15 @@ class Plugin extends AppPlugin {
       panel: null,
       statusEl: null,
       saveInFlight: false,
+      excalApi: null,
+      applyingRemoteUpdate: false,
+      lastRemoteApplyMs: 0,
+      wsUnsub: null,
+      recordUpdateEventId: null,
+      reloadEventId: null,
+      lastBroadcastElements: null,
+      wsThrottleTimer: null,
+      wsPendingBroadcast: false,
     };
 
     let targetPanel = sourcePanel;
@@ -4134,6 +4403,7 @@ class Plugin extends AppPlugin {
         this._createExcalidrawMountElement(React, Excalidraw, session, this, initialData),
       );
 
+      this._installContextMenuGuard(session.shellEl, session);
       this._attachResizeObserver(stage, session);
 
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
@@ -4141,6 +4411,7 @@ class Plugin extends AppPlugin {
       await this._waitForHostLayout(session);
       this._syncPanelLayout(session);
 
+      this._setupRealtimeListeners(session);
       this._setPanelStatus(session, hasContent ? 'Loaded' : 'Ready');
       requestAnimationFrame(() => this._syncPanelLayout(session));
     } catch (e) {
@@ -4304,11 +4575,14 @@ class Plugin extends AppPlugin {
   }
 
   _serializeScene(lib, elements, appState, files) {
+    const filtered = Array.isArray(elements)
+      ? elements.filter((el) => !isDegenerateElement(el))
+      : elements;
     if (lib?.serializeAsJSON) {
       try {
         // serializeAsJSON('local') uses export filters — theme is stripped (export:false).
         const sceneJson = this._patchSceneJsonForStorage(
-          lib.serializeAsJSON(elements, appState, files || {}, 'local'),
+          lib.serializeAsJSON(filtered, appState, files || {}, 'local'),
           appState,
         );
         return { sceneJson };
@@ -4317,7 +4591,7 @@ class Plugin extends AppPlugin {
       }
     }
     return {
-      elements,
+      elements: filtered,
       appState: this._pickAppState(appState),
       files: files || {},
     };
@@ -4350,6 +4624,23 @@ class Plugin extends AppPlugin {
 
     const scene = doc.scene;
     if (!scene) return null;
+
+    if (scene.sceneJson && restore) {
+      try {
+        const parsed = typeof scene.sceneJson === 'string' ? JSON.parse(scene.sceneJson) : scene.sceneJson;
+        const restored = restore(parsed, null, null);
+        const appState = restored?.appState || {};
+        const theme = this._excalThemeValue(appState.theme);
+        return {
+          elements: restored?.elements || [],
+          appState: theme ? { ...appState, theme } : appState,
+          files: restored?.files || {},
+          scrollToContent: true,
+        };
+      } catch (e) {
+        console.warn(`[${EXCAL_PLUGIN_NAME}] restore(scene.sceneJson)`, e);
+      }
+    }
 
     const hasElements = (scene.elements || []).some((x) => x && !x.isDeleted);
     const hasFiles = scene.files && Object.keys(scene.files).length > 0;
@@ -4389,6 +4680,13 @@ class Plugin extends AppPlugin {
     const scene = doc.scene;
     if (!scene) return false;
     if (scene.shareHash) return true;
+    if (scene.sceneJson) {
+      try {
+        const parsed = typeof scene.sceneJson === 'string' ? JSON.parse(scene.sceneJson) : scene.sceneJson;
+        const els = parsed?.elements || [];
+        return els.some((x) => x && !x.isDeleted);
+      } catch (_) {}
+    }
     return (scene.elements || []).some((x) => x && !x.isDeleted);
   }
 
@@ -4608,7 +4906,6 @@ class Plugin extends AppPlugin {
       updatedAt: new Date().toISOString(),
       scene,
     };
-    if (scene?.sceneJson) doc.sceneJson = scene.sceneJson;
 
     const drawingsColl = await this._ensureDrawingsCollection();
     if (!drawingsColl) {
@@ -4670,7 +4967,15 @@ class Plugin extends AppPlugin {
 
     const sceneJson = JSON.stringify(doc);
     try {
-      drawingRecord.prop?.(EXCAL_FIELD_SCENE)?.set?.(sceneJson);
+      const sceneProp = drawingRecord.prop?.(EXCAL_FIELD_SCENE);
+      if (sceneProp?.set) {
+        // v0.5.6: await the DB write. Without this, _flushPanelSession
+        // resolves before Thymer persists the new value, and a quick
+        // hard-refresh sees the previous scene. The prop setter returns
+        // a promise in current Thymer versions.
+        const r = sceneProp.set(sceneJson);
+        if (r && typeof r.then === 'function') await r;
+      }
     } catch (e) {
       console.warn(`[${EXCAL_PLUGIN_NAME}] scene set`, e);
       throw e;
@@ -4697,6 +5002,400 @@ class Plugin extends AppPlugin {
     try {
       localStorage.setItem(this._localDrawKey(recordGuid), JSON.stringify(doc));
     } catch (_) {}
+  }
+
+  _setupRealtimeListeners(session) {
+    if (!this.ws?.onMessage || !this.events?.on) {
+      console.warn(`[${EXCAL_PLUGIN_NAME}] realtime disabled: ws or events API unavailable`);
+      return;
+    }
+    if (session.reloadEventId) return;
+    console.log(`[${EXCAL_PLUGIN_NAME}] DIAG: plugin GUID=${this.getGuid()}, recordGuid=${session.recordGuid}`);
+
+    session.lastBroadcastElements = new Map();
+    try {
+      const initialElements = session.excalApi?.getSceneElements();
+      if (initialElements) {
+        for (const el of initialElements) {
+          session.lastBroadcastElements.set(el.id, _cloneElementSnapshot(el));
+        }
+      }
+    } catch (_) {}
+
+    session.wsUnsub = this.ws.onMessage((msg) => {
+      this._handleIncomingWsMessage(session, msg);
+    });
+
+    session.recordUpdateEventId = this.events.on(
+      'record.updated',
+      (event) => { this._handleRemoteRecordUpdated(session, event); },
+      { collection: '*' },
+    );
+
+    session.reloadEventId = this.events.on('reload', () => {
+      this._handleReload(session);
+    });
+
+    console.log(`[${EXCAL_PLUGIN_NAME}] realtime listeners attached for drawing ${session.recordGuid}`);
+    if (typeof window !== 'undefined') {
+      window.__excalDebug = window.__excalDebug || {};
+      window.__excalDebug[EXCAL_PLUGIN_NAME] = {
+        getPluginGuid: () => this.getGuid(),
+        getSessionInfo: () => ({
+          recordGuid: session.recordGuid,
+          elementCount: session.excalApi?.getSceneElements()?.length,
+          wsAvailable: !!this.ws?.broadcast,
+        }),
+        injectWsMessage: (fakeMsg) => {
+          this._handleIncomingWsMessage(session, fakeMsg);
+        },
+      };
+    }
+  }
+
+  _teardownRealtimeListeners(session) {
+    if (!session) return;
+    try { session.wsUnsub?.(); } catch (_) {}
+    if (session.recordUpdateEventId) {
+      try { this.events?.off?.(session.recordUpdateEventId); } catch (_) {}
+    }
+    if (session.reloadEventId) {
+      try { this.events?.off?.(session.reloadEventId); } catch (_) {}
+    }
+    if (session.wsThrottleTimer) {
+      clearTimeout(session.wsThrottleTimer);
+    }
+    if (session._contextMenuGuardDispose) {
+      try { session._contextMenuGuardDispose(); } catch (_) {}
+    }
+    session.wsUnsub = null;
+    session.recordUpdateEventId = null;
+    session.reloadEventId = null;
+    session.lastBroadcastElements = null;
+    session.wsThrottleTimer = null;
+    session.wsPendingBroadcast = false;
+    session.applyingRemoteUpdate = false;
+  }
+
+  _scheduleWsBroadcast(session, elements) {
+    if (!session.lastBroadcastElements) {
+      session.lastBroadcastElements = new Map();
+      for (const el of elements) {
+        // Clone so subsequent in-place mutations by Excalidraw don't
+        // silently update our delta-detection snapshot.
+        session.lastBroadcastElements.set(el.id, { ...el, points: Array.isArray(el.points) ? el.points.slice() : el.points });
+      }
+      this._broadcastElementDelta(session, elements);
+      return;
+    }
+    if (session.wsThrottleTimer) {
+      session.wsPendingBroadcast = true;
+      return;
+    }
+    this._broadcastElementDelta(session, elements);
+    session.wsThrottleTimer = setTimeout(() => {
+      session.wsThrottleTimer = null;
+      // Always broadcast in the throttle callback so the final state after the
+      // user finishes drawing is delivered. _broadcastElementDelta will skip
+      // the WS send if the delta is empty.
+      if (session.excalApi) {
+        try {
+          this._broadcastElementDelta(session, session.excalApi.getSceneElements());
+        } catch (e) {
+          console.warn(`[${EXCAL_PLUGIN_NAME}] throttle-broadcast`, e);
+        }
+      }
+    }, EXCAL_WS_THROTTLE_MS);
+  }
+
+  _broadcastElementDelta(session, currentElements) {
+    if (!this.ws?.broadcast) { console.warn(`[${EXCAL_PLUGIN_NAME}] ws.broadcast unavailable — delta dropped`); return; }
+    const prev = session.lastBroadcastElements;
+    const delta = [];
+    const deletedIds = [];
+    const currentIds = new Set();
+    let degenerateSkipped = 0;
+
+    for (const el of currentElements) {
+      currentIds.add(el.id);
+      const prevEl = prev.get(el.id);
+      if (!prevEl || prevEl.version !== el.version || prevEl.versionNonce !== el.versionNonce) {
+        if (isDegenerateElement(el)) { degenerateSkipped++; continue; }
+        delta.push(el);
+      }
+    }
+
+    for (const [id, prevEl] of prev) {
+      if (!currentIds.has(id) && !prevEl.isDeleted) {
+        deletedIds.push(id);
+      }
+    }
+
+    for (const el of delta) {
+      // Store a CLONE so the snapshot we keep for delta-detection isn't
+      // mutated in place by Excalidraw between broadcasts. Otherwise
+      // every subsequent broadcast sees prevEl.version === el.version
+      // (the same object) and emits an empty delta.
+      prev.set(el.id, _cloneElementSnapshot(el));
+    }
+    for (const id of deletedIds) {
+      prev.delete(id);
+    }
+
+    if (delta.length === 0 && deletedIds.length === 0) {
+      if (degenerateSkipped > 0) {
+        console.log(`[${EXCAL_PLUGIN_NAME}] [${session._instanceTag || session.senderId}] DIAG: skipped ${degenerateSkipped} degenerate (in-progress) element(s)`);
+      }
+      return;
+    }
+    try {
+      for (const el of delta) {
+        const pts = el?.points;
+        const firstPt = Array.isArray(pts) && pts.length ? JSON.stringify(pts[0]) : 'n/a';
+        const lastPt = Array.isArray(pts) && pts.length ? JSON.stringify(pts[pts.length - 1]) : 'n/a';
+        console.log(`[${EXCAL_PLUGIN_NAME}] [${session._instanceTag || session.senderId}] DIAG BROADCAST: id=${el?.id} type=${el?.type} pointsLen=${Array.isArray(pts) ? pts.length : 'n/a'} firstPt=${firstPt} lastPt=${lastPt} version=${el?.version} vNonce=${el?.versionNonce}`);
+      }
+    } catch (e) { /* DIAG only */ }
+    console.log(`[${EXCAL_PLUGIN_NAME}] [${session._instanceTag || session.senderId}] DIAG: broadcasting ${delta.length} changed, ${deletedIds.length} deleted, ${degenerateSkipped} degenerate-skipped`);
+
+    this.ws.broadcast({
+      type: EXCAL_WS_MSG_TYPE,
+      data: {
+        senderId: session.senderId,
+        drawingGuid: session.recordGuid,
+        elements: delta,
+        deletedIds,
+        // v0.5.6 bug 7: include the full scene order so receivers can
+        // re-layer elements (Excalidraw uses array order for z-order).
+        // The delta alone doesn't carry order information — without this,
+        // a layer-order change on tab B doesn't sync to tab A.
+        sceneOrder: currentElements.map((e) => e.id),
+      },
+    });
+  }
+
+  _handleIncomingWsMessage(session, msg) {
+    if (!session?.excalApi) return;
+    if (msg.type !== EXCAL_WS_MSG_TYPE) return;
+    const data = msg.data;
+    if (!data) {
+      console.log(`[${EXCAL_PLUGIN_NAME}] DIAG: WS msg missing data field (msg keys: ${Object.keys(msg || {}).join(',')})`);
+      return;
+    }
+    console.log(`[${EXCAL_PLUGIN_NAME}] [${session._instanceTag || session.senderId}] DIAG: WS recv type=${msg?.type} fromPG=${msg?.fromPluginGuid} myG=${this.getGuid()} senderId=${data.senderId} mySender=${session.senderId} match=${data.senderId === session.senderId} drawing=${data.drawingGuid} sessionR=${session?.recordGuid}`);
+    if (data.senderId && data.senderId === session.senderId) {
+      console.log(`[${EXCAL_PLUGIN_NAME}] [${session._instanceTag || session.senderId}] DIAG: WS self-msg filtered out (senderId matches my session)`);
+      return;
+    }
+    if (data.drawingGuid !== session.recordGuid) return;
+    if (!data.elements?.length && !data.deletedIds?.length) {
+      console.log(`[${EXCAL_PLUGIN_NAME}] DIAG: WS msg passed filters but empty content`);
+      return;
+    }
+    console.log(`[${EXCAL_PLUGIN_NAME}] DIAG: applying remote ${data.elements?.length} els, ${data.deletedIds?.length} deleted`);
+    const firstEl = data.elements?.[0];
+    if (firstEl) {
+      const approxBytes = JSON.stringify(firstEl).length;
+      console.log(`[${EXCAL_PLUGIN_NAME}] DIAG: first el type=${firstEl.type} pointsLen=${firstEl.points?.length ?? 'n/a'} bytes=${approxBytes}`);
+    }
+
+    try {
+      let incomingElements = data.elements || [];
+      try {
+        for (const el of incomingElements) {
+          const pts = el?.points;
+          const firstPt = Array.isArray(pts) && pts.length ? JSON.stringify(pts[0]) : 'n/a';
+          const lastPt = Array.isArray(pts) && pts.length ? JSON.stringify(pts[pts.length - 1]) : 'n/a';
+          console.log(`[${EXCAL_PLUGIN_NAME}] [${session._instanceTag || session.senderId}] DIAG RECV pre-restore: id=${el?.id} type=${el?.type} pointsLen=${Array.isArray(pts) ? pts.length : 'n/a'} firstPt=${firstPt} lastPt=${lastPt} version=${el?.version} vNonce=${el?.versionNonce}`);
+        }
+      } catch (_) { /* DIAG only */ }
+      if (incomingElements.length && session.excalLib?.restoreElements) {
+        try {
+          const restored = session.excalLib.restoreElements(incomingElements, null);
+          if (Array.isArray(restored) && restored.length) {
+            incomingElements = restored;
+          }
+        } catch (e) {
+          console.warn(`[${EXCAL_PLUGIN_NAME}] restoreElements failed — using raw`, e);
+        }
+      }
+      try {
+        for (const el of incomingElements) {
+          const pts = el?.points;
+          const firstPt = Array.isArray(pts) && pts.length ? JSON.stringify(pts[0]) : 'n/a';
+          const lastPt = Array.isArray(pts) && pts.length ? JSON.stringify(pts[pts.length - 1]) : 'n/a';
+          console.log(`[${EXCAL_PLUGIN_NAME}] [${session._instanceTag || session.senderId}] DIAG RECV post-restore: id=${el?.id} type=${el?.type} pointsLen=${Array.isArray(pts) ? pts.length : 'n/a'} firstPt=${firstPt} lastPt=${lastPt} version=${el?.version} vNonce=${el?.versionNonce}`);
+        }
+      } catch (_) { /* DIAG only */ }
+      const localElements = session.excalApi.getSceneElements();
+      const merged = this._mergeSceneElements(localElements, incomingElements, data.deletedIds || []);
+      // v0.5.6 bug 7: apply the sender's scene order so layer-order
+      // changes (z-order in Excalidraw is the array order) propagate.
+      // Only apply if the sender's data is newer — measured by whether
+      // any incoming element has a higher version than its local
+      // counterpart, or by whether the sender's order differs at all
+      // and includes newer elements.
+      let ordered = merged;
+      if (Array.isArray(data.sceneOrder) && data.sceneOrder.length) {
+        const mergedMap = new Map(merged.map((e) => [e.id, e]));
+        const localMap = new Map(localElements.map((e) => [e.id, e]));
+        // Has the sender's order actually changed relative to local?
+        const localOrder = localElements.map((e) => e.id);
+        const orderChanged = data.sceneOrder.length !== localOrder.length ||
+          data.sceneOrder.some((id, i) => id !== localOrder[i]);
+        // Is the sender's data newer than local for at least one element?
+        const senderNewer = incomingElements.some((inc) => {
+          const loc = localMap.get(inc.id);
+          return !loc || inc.version > loc.version ||
+            (inc.version === loc.version && inc.versionNonce !== loc.versionNonce);
+        });
+        if (orderChanged && senderNewer) {
+          // Build the new array in sender's order, then append any
+          // elements local has that the sender's order didn't list
+          // (shouldn't happen for normal scenes, but be defensive).
+          const seen = new Set();
+          ordered = [];
+          for (const id of data.sceneOrder) {
+            const el = mergedMap.get(id);
+            if (el) { ordered.push(el); seen.add(id); }
+          }
+          for (const el of merged) {
+            if (!seen.has(el.id)) ordered.push(el);
+          }
+        }
+      }
+      const lb = session.lastBroadcastElements;
+
+      session.applyingRemoteUpdate = true;
+      session.lastRemoteApplyMs = Date.now();
+      try {
+        for (const el of ordered) {
+          const pts = el?.points;
+          const firstPt = Array.isArray(pts) && pts.length ? JSON.stringify(pts[0]) : 'n/a';
+          const lastPt = Array.isArray(pts) && pts.length ? JSON.stringify(pts[pts.length - 1]) : 'n/a';
+          console.log(`[${EXCAL_PLUGIN_NAME}] [${session._instanceTag || session.senderId}] DIAG updateScene (WS): id=${el?.id} type=${el?.type} pointsLen=${Array.isArray(pts) ? pts.length : 'n/a'} firstPt=${firstPt} lastPt=${lastPt} isDeleted=${!!el?.isDeleted}`);
+        }
+      } catch (_) { /* DIAG only */ }
+      session.excalApi.updateScene({ elements: ordered });
+
+      session.applyingRemoteUpdate = false;
+
+      if (lb) {
+        lb.clear();
+        const actualScene = session.excalApi.getSceneElements();
+        for (const el of actualScene) {
+          // v0.5.6: clone before storing (same trap as bug 3, on the WS-receive
+          // re-seed path). Without this, the snapshot follows Excalidraw's
+          // in-place mutations and the next local onChange emits an empty
+          // delta, so a move on tab B never reaches tab A.
+          lb.set(el.id, _cloneElementSnapshot(el));
+        }
+        for (const id of data.deletedIds || []) {
+          lb.delete(id);
+        }
+      }
+    } catch (e) {
+      console.warn(`[${EXCAL_PLUGIN_NAME}] ws handle`, e);
+    }
+  }
+
+  _mergeSceneElements(localElements, incomingElements, deletedIds) {
+    const map = new Map();
+    for (const el of localElements) {
+      map.set(el.id, el);
+    }
+    for (const el of incomingElements) {
+      const local = map.get(el.id);
+      if (!local) {
+        map.set(el.id, el);
+      } else if (el.version > local.version) {
+        map.set(el.id, el);
+      } else if (el.version === local.version && el.versionNonce !== local.versionNonce) {
+        map.set(el.id, el);
+      }
+    }
+    for (const id of deletedIds) {
+      const local = map.get(id);
+      if (local && !local.isDeleted) {
+        map.set(id, { ...local, isDeleted: true });
+      }
+    }
+    return Array.from(map.values());
+  }
+
+  async _handleRemoteRecordUpdated(session, event) {
+    if (!session?.drawingRecordGuid) return;
+    if (event.source?.isLocal) return;
+    if (event.recordGuid !== session.drawingRecordGuid) return;
+    if (!session.excalApi) return;
+
+    try {
+      const record = this.data.getRecord(event.recordGuid);
+      if (!record) return;
+      const sceneText = record.text(EXCAL_FIELD_SCENE);
+      if (!sceneText) return;
+      const parsed = JSON.parse(sceneText);
+      const restored = session.excalLib?.restore
+        ? session.excalLib.restore(parsed, null, null)
+        : parsed;
+      const savedElements = restored?.elements || parsed?.elements || [];
+      if (!savedElements.length) return;
+
+      const localElements = session.excalApi.getSceneElements();
+      const merged = this._mergeSceneElements(localElements, savedElements, []);
+
+      session.applyingRemoteUpdate = true;
+      session.lastRemoteApplyMs = Date.now();
+      session.excalApi.updateScene({ elements: merged });
+      session.applyingRemoteUpdate = false;
+      const lb = session.lastBroadcastElements;
+      if (lb) {
+        lb.clear();
+        const actualScene = session.excalApi.getSceneElements();
+        for (const el of actualScene) {
+          lb.set(el.id, _cloneElementSnapshot(el));
+        }
+      }
+    } catch (e) {
+      console.warn(`[${EXCAL_PLUGIN_NAME}] record update reconcil`, e);
+    }
+  }
+
+  async _handleReload(session) {
+    if (!session?.drawingRecordGuid || !session.excalApi) return;
+    try {
+      const drawingsColl = await this._ensureDrawingsCollection();
+      if (!drawingsColl) return;
+      const all = await drawingsColl.getAllRecords();
+      const record = (all || []).find((r) => r.guid === session.drawingRecordGuid);
+      if (!record) return;
+      const sceneText = record.text(EXCAL_FIELD_SCENE);
+      if (!sceneText) return;
+      const parsed = JSON.parse(sceneText);
+      const restored = session.excalLib?.restore
+        ? session.excalLib.restore(parsed, null, null)
+        : parsed;
+      const savedElements = restored?.elements || parsed?.elements || [];
+      if (!savedElements.length) return;
+
+      const localElements = session.excalApi.getSceneElements();
+      const merged = this._mergeSceneElements(localElements, savedElements, []);
+
+      session.applyingRemoteUpdate = true;
+      session.lastRemoteApplyMs = Date.now();
+      session.excalApi.updateScene({ elements: merged });
+      session.applyingRemoteUpdate = false;
+
+      if (session.lastBroadcastElements) {
+        session.lastBroadcastElements.clear();
+        const actualScene = session.excalApi.getSceneElements();
+        for (const el of actualScene) {
+          session.lastBroadcastElements.set(el.id, _cloneElementSnapshot(el));
+        }
+      }
+    } catch (e) {
+      console.warn(`[${EXCAL_PLUGIN_NAME}] reload reconcil`, e);
+    }
   }
 
   async _flushPanelSession(force) {

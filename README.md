@@ -48,3 +48,36 @@ Legacy drawings in **Plugin Backend** (`record_kind` = `drawing`) are still **re
 |-----|---------|---------|
 | `cdnVersion` | `0.17.6` | Pin `@excalidraw/excalidraw` UMD version |
 | `autosaveMs` | `1500` | Debounced save delay (minimum 800) |
+
+## Changelog (v0.3.0 → v0.5.8)
+
+### v0.5.8 — Scene load bugfix & diagnostics
+- **Fixed blank canvas on reload**: v3 save format (`doc.scene.sceneJson`) was never parsed by `_buildInitialData` — the function returned `null` on every load, so Excalidraw always started empty. Added a third branch that parses the nested JSON string through `lib.restore()`.
+- **Fixed `_isDrawingsCollection` dead code**: `_getAllDrawingsCollections` called a nonexistent method; the `try/catch` silently swallowed it, so multi-collection search was always returning only the primary collection.
+- **Cache-null re-query**: A cached `null` from a transient failure could permanently poison the drawing record cache. Only return early on truthy cache hits now.
+- Added `first_seen_at_ms` backfill to disambiguate duplicate Excalidrawings collections by their record age.
+
+### v0.5.7 — Context menu suppression
+- **Right-click inside the Excalidraw panel** no longer opens Thymer's note-action context menu in addition to Excalidraw's own. Installed a capture-phase `contextmenu` guard on the panel shell that calls `stopPropagation()`.
+- Guard is removed on panel close via `_teardownRealtimeListeners`.
+
+### v0.5.6 — Real-time sync (WebSocket + event-driven)
+- **Shape sync between tabs**: Rectangles, ellipses, diamonds now sync between browser tabs. In-progress zero-size shape states (between pointer-down and pointer-up) are filtered out via `isDegenerateElement()`.
+- **Bidirectional move sync**: Extracted `_cloneElementSnapshot()` and applied it to all 5 re-seed sites, preventing in-place mutation from poisoning the delta-filter snapshot. Moves on either tab now propagate correctly.
+- **Layer-order (z-order) sync**: Broadcasting full `sceneOrder` array so layer changes (bring to front/send to back) propagate across tabs. The receiver applies the order only when incoming data is newer (LWW).
+- **Save await**: `_saveDrawingDoc` now awaits the prop setter promise, so the DB write truly completes before the panel session is flushed.
+- **Echo guard applied to save path** as well as broadcast path to prevent echo-triggered re-saves.
+
+### v0.5.5 — Sync & persistence fixes
+- **Line→dot save bug**: `isDegenerateFreedraw` filter now also runs in `_serializeScene`, so mid-stroke pause autosaves don't persist degenerate 1–5 point dots.
+- **Two-tab divergence**: `lastBroadcastElements` now stores shallow clones of elements instead of live references, preventing in-place mutation from causing empty deltas.
+- **Throttle callback always broadcasts**: the timeout callback now unconditionally calls `_broadcastElementDelta`, which short-circuits if the delta is empty.
+- **Anti-LWW force-apply block removed**: the merge is now a true LWW by `version` + `versionNonce`.
+- **Duplicate `sceneJson` key removed** from the saved doc (was writing both `doc.scene.sceneJson` and top-level `doc.sceneJson`).
+
+### v0.3.0 — Build tooling & development infrastructure
+- **esbuild dev server** (`dev.js`): watch mode with CDP hot-reload via Chrome DevTools Protocol.
+- **Deploy script** (`scripts/deploy-plugin.mjs`): MCP-based build + preview + persist pipeline, supporting `THYMER_WS_GUID` targeting.
+- **Documentation**: `DEBUG.md` (8 gotchas from the v0.5.5 sync-bug session), `CONTEXT.md` (architecture), `DEPLOYMENT.md` (deploy commands), `TESTING.md` (test setup), `AGENT_NOTES.md` (agent workflow).
+- **Test harness**: `tests/` directory with sync test scripts (baseline, two-tab sync).
+- **Diagnostics**: `__excalDebug` global for runtime introspection, duplicate collection detection, element-level DIAG logging for WS broadcasts.

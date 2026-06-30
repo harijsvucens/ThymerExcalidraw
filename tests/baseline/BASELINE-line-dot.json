@@ -1,0 +1,112 @@
+{
+  "baseline_captured_at": "2026-06-29T16:42:57.149Z",
+  "T1": {
+    "inMemory": {
+      "elementCount": 4,
+      "maxVersion": 45,
+      "newElements": [
+        {
+          "type": "freedraw",
+          "points": 44,
+          "w": 249,
+          "h": 92.90411376953125,
+          "v": 45
+        },
+        {
+          "type": "freedraw",
+          "points": 26,
+          "w": 144,
+          "h": 49.8934326171875,
+          "v": 27
+        }
+      ]
+    },
+    "persisted": {
+      "elementCount": 2,
+      "maxVersion": 6,
+      "elements": [
+        {
+          "id": "sKOjT5roFmrPRMfs-d62W",
+          "type": "freedraw",
+          "points": [
+            [
+              0,
+              0
+            ],
+            [
+              230,
+              61
+            ],
+            [
+              224,
+              61
+            ],
+            [
+              212,
+              61
+            ],
+            [
+              209,
+              61
+            ]
+          ],
+          "width": 230,
+          "height": 61,
+          "version": 6,
+          "versionNonce": 2010306884,
+          "x": 424.16,
+          "y": 4.27
+        },
+        {
+          "id": "Hp_Xe3M3BQYpKydZJ_6QI",
+          "type": "freedraw",
+          "points": [
+            [
+              0,
+              0
+            ],
+            [
+              6,
+              9.7354736328125
+            ]
+          ],
+          "width": 6,
+          "height": 9.74,
+          "version": 3,
+          "versionNonce": 1832043588,
+          "x": 424.16,
+          "y": 204.27
+        }
+      ]
+    },
+    "T1_pass": false
+  },
+  "T3": {
+    "savedDots": [
+      {
+        "id": "Hp_Xe3M3BQYpKydZJ_6QI",
+        "type": "freedraw",
+        "points": 2,
+        "w": 6,
+        "h": 9.74
+      }
+    ],
+    "T3_pass": false
+  },
+  "bug1_evidence": {
+    "inMemoryStroke1Points": 44,
+    "savedStroke1Points": 5,
+    "inMemoryStroke2Points": 26,
+    "savedStroke2Points": 2,
+    "savedVersionVsInMemory": {
+      "saved": 6,
+      "inMemory": 45
+    },
+    "interpretation": "Autosave fires mid-stroke, captures intermediate state. The v0.5.3 fix filters degenerate freedraws at BROADCAST level only, not at SAVE level."
+  },
+  "diags": {
+    "broadcasts": 2,
+    "onChange": 130,
+    "saveStatus": 0
+  }
+}
