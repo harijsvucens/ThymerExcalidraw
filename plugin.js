@@ -2426,7 +2426,7 @@ const EXCAL_PLUGIN_ID = 'excalidraw';
 const EXCAL_MODE_KEY = 'thymerext_ps_mode_excalidraw';
 const EXCAL_DRAW_PREFIX = 'excal_draw_v1_';
 const EXCAL_PANEL_TYPE = 'excalidraw-editor';
-const EXCAL_VERSION = '0.6.2';
+const EXCAL_VERSION = '0.6.5';
 const EXCAL_ICON = 'ti-palette';
 const EXCAL_FRAME_PAD_X = 12;
 const EXCAL_FRAME_PAD_TOP = 28;
@@ -3871,23 +3871,61 @@ class Plugin extends AppPlugin {
         const mountEcho = !!session._initialSceneSignature
           && liveSig === session._initialSceneSignature
           && elements.length > 0;
+        // v0.6.3: real deletion detection. `appState?.deletedIds` is not a
+        // field Excalidraw's AppState actually has -- deletions surface as
+        // `isDeleted: true` entries inside `elements`, so the old check was
+        // always vacuously true and never once excused a legitimate delete.
+        // Compare the live (non-deleted) id set against the previous
+        // onChange's set instead; the difference is the count of elements
+        // the user actually removed since last time.
+        const currentLiveIds = new Set();
+        if (Array.isArray(elements)) {
+          for (const e of elements) { if (e && !e.isDeleted) currentLiveIds.add(e.id); }
+        }
+        let explicitDeletionCount = 0;
+        if (session._lastSeenLiveIds) {
+          for (const id of session._lastSeenLiveIds) {
+            if (!currentLiveIds.has(id)) explicitDeletionCount += 1;
+          }
+        }
         const emptyOverPopulated = session._hadNonEmptyInitialData === true
           && elements.length === 0
-          && (!Array.isArray(appState?.deletedIds) || appState.deletedIds.length === 0)
+          && explicitDeletionCount === 0
           && session.lastBroadcastElements
           && session.lastBroadcastElements.size > 0;
         // v0.6.2: Layer 4 — DB-aware guard. If the live scene has fewer
-        // non-deleted elements than the DB scene (and no explicit deletions),
-        // refuse the save. This prevents partial-scene overwrite when the
-        // load returned empty from poisoned localStorage but WS deltas from
-        // another tab have been applied.
-        const liveNonDeleted = Array.isArray(elements)
-          ? elements.filter((e) => e && !e.isDeleted).length : 0;
+        // non-deleted elements than the DB scene (and the drop isn't fully
+        // explained by tracked deletions), refuse the save. This prevents
+        // partial-scene overwrite when the load returned empty from
+        // poisoned localStorage but WS deltas from another tab have been
+        // applied.
+        //
+        // v0.6.3: this guard no longer turns itself off once
+        // `_hadNonEmptyInitialData` becomes true. Previously it only ever
+        // applied during the narrow window before the first healthy load,
+        // so a later partial element loss in an otherwise-normal session
+        // (sync bug, bad merge, dropped WS delta) sailed straight through
+        // unguarded as long as the count didn't hit exactly zero. `dbCount`
+        // is now a running floor updated after every successful load,
+        // reload, and save (see _flushPanelSession / _reloadDrawingDoc), so
+        // this stays meaningful for the life of the session, not just
+        // before the first load.
+        const liveNonDeleted = currentLiveIds.size;
         const dbCount = session._dbSceneElementCount || 0;
+        const unexplainedDrop = dbCount - liveNonDeleted;
         const dbAwareBlocked = dbCount > 0
-          && liveNonDeleted < dbCount
-          && (!Array.isArray(appState?.deletedIds) || appState.deletedIds.length === 0)
-          && session._hadNonEmptyInitialData !== true;
+          && unexplainedDrop > 0
+          && unexplainedDrop > explicitDeletionCount;
+        // v0.6.5: ratchet the floor down when the entire drop is explained
+        // by tracked deletions. Without this, _flushPanelSession's guard
+        // (which has no deletion tracking of its own) compares pendingCount
+        // against the stale pre-deletion floor and refuses a legitimate
+        // save -- then every subsequent onChange sees `unexplainedDrop > 0`
+        // with no new `explicitDeletionCount` and blocks permanently.
+        if (dbCount > 0 && unexplainedDrop > 0 && unexplainedDrop <= explicitDeletionCount) {
+          session._dbSceneElementCount = liveNonDeleted;
+        }
+        session._lastSeenLiveIds = currentLiveIds;
         const saveSuppressed = emptyOverPopulated || dbAwareBlocked;
         const broadcastSuppressed = echoSuppressed || mountEcho;
         if (mountEcho) {
@@ -4099,6 +4137,15 @@ class Plugin extends AppPlugin {
         background: rgba(0, 0, 0, 0.2);
         z-index: 2;
         border-radius: ${EXCAL_INNER_RADIUS}px;
+      }
+      .excal-panel-statusbar > .excal-version-tag {
+        font-size: 9px;
+        font-weight: 500;
+        opacity: 0.5;
+        letter-spacing: 0.04em;
+        margin-left: 2px;
+        line-height: 1;
+        pointer-events: none;
       }
       .excal-panel-statusbar > .excal-data-btn {
         pointer-events: auto;
@@ -4467,7 +4514,18 @@ class Plugin extends AppPlugin {
       _hadNonEmptyInitialData: false,
       // v0.6.2: element count from the DB at load time, so the save
       // guard can refuse to write a partial scene over populated DB data.
+      // v0.6.3: this is now a running floor, not a load-time snapshot --
+      // it is also updated after every successful save and after
+      // _reloadDrawingDoc, so the guard stays meaningful for the whole
+      // session instead of only until the first healthy load.
       _dbSceneElementCount: 0,
+      // v0.6.3: set of non-deleted element ids seen on the previous
+      // onChange, used to tell a real user delete apart from an
+      // unexplained element drop (sync bug, partial merge, etc). Replaces
+      // the old `appState?.deletedIds` check, which never actually fired --
+      // Excalidraw's real AppState has no `deletedIds` field; deletions
+      // show up as `isDeleted: true` entries inside `elements`.
+      _lastSeenLiveIds: null,
       // v0.6.1: signature of the loaded scene (length + sorted ids).
       // onChange events whose scene matches this signature are echoes
       // of the initial commit, not user edits — skip the save.
@@ -4535,6 +4593,10 @@ class Plugin extends AppPlugin {
     const statusText = document.createElement('span');
     statusText.textContent = 'Loading…';
     statusBar.appendChild(statusText);
+    const verTag = document.createElement('span');
+    verTag.className = 'excal-version-tag';
+    verTag.textContent = EXCAL_VERSION;
+    statusBar.appendChild(verTag);
     session.statusEl = statusBar;
     session.statusTextEl = statusText;
 
@@ -5121,6 +5183,15 @@ class Plugin extends AppPlugin {
     // is empty, the DB wins regardless of updatedAt (prevents stale empty
     // localStorage from pre-v0.6.1 mount-echo bleaches from blanking the
     // canvas). See DEBUG.md §5.14.
+    //
+    // v0.6.3: the same override is now also checked against the legacy
+    // Plugin Backend row (`fromRow`), not just localStorage. `_pickNewerDoc`
+    // itself is still a pure updatedAt comparison with no content awareness,
+    // so a stale/empty legacy row with a newer-looking `updatedAt` than the
+    // real Excalidrawings collection record could win the cascade and blank
+    // the canvas via the exact mechanism v0.6.2 fixed for localStorage --
+    // just sourced from `fromRow` instead of `fromLocal`, which the old
+    // check never looked at.
     const picked = this._pickNewerDoc(fromCollection, this._pickNewerDoc(fromRow, fromLocal));
     const session = this._panelSession;
     const dbCount = fromCollection ? this._countDocNonDeleted(fromCollection) : 0;
@@ -5128,8 +5199,10 @@ class Plugin extends AppPlugin {
       session._dbSceneElementCount = dbCount;
     }
     if (fromCollection && this._sceneDocHasContent(fromCollection)) {
-      if (picked === fromLocal && !this._sceneDocHasContent(fromLocal)) {
-        console.log(`[${EXCAL_PLUGIN_NAME}] DB-wins: collection has content but localStorage is empty; using collection doc`);
+      const pickedIsEmptyLocal = picked === fromLocal && !this._sceneDocHasContent(fromLocal);
+      const pickedIsEmptyLegacyRow = picked === fromRow && !this._sceneDocHasContent(fromRow);
+      if (pickedIsEmptyLocal || pickedIsEmptyLegacyRow) {
+        console.log(`[${EXCAL_PLUGIN_NAME}] DB-wins: collection has content but ${pickedIsEmptyLocal ? 'localStorage' : 'legacy row'} is empty; using collection doc`);
         return fromCollection;
       }
     }
@@ -5587,6 +5660,18 @@ class Plugin extends AppPlugin {
 
       session.applyingRemoteUpdate = false;
 
+      // v0.6.3: ratchet the DB-aware guard's floor (and its live-id
+      // snapshot) to the just-applied merged state. Without this, a
+      // legitimate remote deletion applied here (from another tab) would
+      // leave `_dbSceneElementCount` at its old, higher pre-delta value;
+      // this tab's *next* local onChange would then see an "unexplained"
+      // drop against that stale floor and could refuse a perfectly good
+      // save.
+      const mergedLiveIds = new Set();
+      for (const el of ordered) { if (el && !el.isDeleted) mergedLiveIds.add(el.id); }
+      session._dbSceneElementCount = mergedLiveIds.size;
+      session._lastSeenLiveIds = mergedLiveIds;
+
       if (lb) {
         lb.clear();
         const actualScene = session.excalApi.getSceneElements();
@@ -5731,8 +5816,20 @@ class Plugin extends AppPlugin {
     }
 
     // v0.6.2: DB-aware flush guard. If the pending scene has fewer
-    // elements than the DB and no explicit deletions, refuse the save.
-    if (session._dbSceneElementCount > 0 && session.pendingScene && session._hadNonEmptyInitialData !== true) {
+    // elements than the DB, refuse the save. This is the final backstop
+    // behind the onChange-level guard (which already screens pendingScene
+    // before it gets this far using real deletion tracking); this check
+    // stays intentionally simpler/more conservative since it only sees the
+    // serialized doc, not live elements+appState.
+    //
+    // v0.6.3: removed the `_hadNonEmptyInitialData !== true` gate that
+    // previously disabled this guard for the rest of the session as soon
+    // as the first load looked healthy -- that made it a one-shot check
+    // that almost never applied in the common case. `_dbSceneElementCount`
+    // is now ratcheted forward below after every successful save (and in
+    // _reloadDrawingDoc), so comparing against it stays meaningful instead
+    // of comparing against a stale load-time snapshot forever.
+    if (session._dbSceneElementCount > 0 && session.pendingScene) {
       const pendingCount = _excalSerializedElementCount(session.pendingScene);
       if (pendingCount < session._dbSceneElementCount && pendingCount >= 0) {
         console.warn(
@@ -5751,6 +5848,23 @@ class Plugin extends AppPlugin {
         await this._saveDrawingDoc(session.recordGuid, session.recordName, session.pendingScene);
         session.dirty = false;
         this._setPanelStatus(session, 'Changes saved');
+        // v0.6.3: ratchet the floor forward on every successful save so a
+        // legitimate reduction (real deletions) becomes the new accepted
+        // baseline, instead of comparing every future save against the
+        // element count from the moment the panel was opened.
+        // Also ratchet _lastSeenLiveIds so the next onChange diffs against
+        // the just-saved state rather than a stale pre-save snapshot.
+        const savedCount = _excalSerializedElementCount(session.pendingScene);
+        if (savedCount >= 0) {
+          session._dbSceneElementCount = savedCount;
+          if (session.pendingScene?.scene?.elements) {
+            session._lastSeenLiveIds = new Set(
+              session.pendingScene.scene.elements
+                .filter(e => e && !e.isDeleted)
+                .map(e => e.id)
+            );
+          }
+        }
       }
     } catch (e) {
       console.error(`[${EXCAL_PLUGIN_NAME}] save`, e);

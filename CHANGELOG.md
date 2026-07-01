@@ -1,5 +1,25 @@
 # ThymerExcalidraw Changelog
 
+## 0.6.5 — 2026-07-01
+
+### Fixed (permanent save-block after legitimate deletion)
+
+- **Root cause.** The v0.6.2 `_flushPanelSession` guard (lines ~5823–5832) compared `pendingCount` against `_dbSceneElementCount` with no deletion tracking. After a real deletion, the count dropped below the floor, the guard refused the save, and the floor was never ratcheted down — so every subsequent `onChange` also refused. The plugin fell into a permanent save-block: the user could delete elements but the DB never reflected it, and on panel reopen the deleted elements reappeared.
+
+- **Fix (v0.6.5): Ratchet floor on legitimate deletions.** In the `onChange` handler, after computing `explicitDeletionCount` from the id-diff, if the entire drop is explained by deletions (`unexplainedDrop <= explicitDeletionCount`), ratchet `_dbSceneElementCount` down to the current live count. This ensures `_flushPanelSession` sees a realistic floor on the next save attempt.
+
+- **Fix (v0.6.3): Real deletion detection replaces dead `appState.deletedIds` check.** The old `emptyOverPopulated` guard checked `appState?.deletedIds` — but Excalidraw's real AppState has no `deletedIds` field; deletions surface as `isDeleted: true` entries inside `elements`. The check always returned truthy (vacuously), so the guard never excused a legitimate delete. Replaced with an id-diff heuristic (`_lastSeenLiveIds` vs `currentLiveIds`) that matches the broadcast code's (`_broadcastElementDelta`, line 5490–5494) production-proven approach.
+
+- **Fix (v0.6.3): DB-aware guard now runs perpetually.** The v0.6.2 guard was gated on `_hadNonEmptyInitialData !== true`, which disabled it for the rest of the session after the first healthy load. Changed to a running floor updated after every successful load, reload, WS merge, and save — the guard stays meaningful for the life of the session.
+
+- **Fix (v0.6.3): Legacy-row empty-override in `_pickNewerDoc`.** `_pickNewerDoc` uses a pure `updatedAt` comparison with no content awareness. A stale/empty legacy Plugin Backend row (`fromRow`) with a newer `updatedAt` than the real Excalidrawings collection record could win the cascade and blank the canvas — the same mechanism v0.6.2 fixed for localStorage, but sourced from `fromRow`. Added the same content-aware override.
+
+- **Fix (v0.6.3): Ratchet floor after WS merge.** After `_mergeSceneElements` applies a remote delta, `_dbSceneElementCount` and `_lastSeenLiveIds` are updated to match the merged state. Without this, a legitimate remote deletion from another tab left the floor at its old higher value, and the local tab's next `onChange` would see an "unexplained" drop.
+
+- **UX: Version tag in status bar.** Added a small `v0.6.5` tag in the panel status bar for easy version identification without opening the browser console.
+
+- Probe line: `explicitDeletionCount=N unexplainedDrop=M dbAwareBlocked=...` in onChange handler.
+
 ## 0.6.2 — 2026-07-01
 
 ### Fixed (stale localStorage could override populated DB; partial-scene save via WS could overwrite populated DB)

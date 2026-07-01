@@ -47,9 +47,18 @@ Legacy drawings in **Plugin Backend** (`record_kind` = `drawing`) are still **re
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `cdnVersion` | `0.17.6` | Pin `@excalidraw/excalidraw` UMD version |
-| `autosaveMs` | `1500` | Debounced save delay (minimum 800) |
+| `autosaveMs` | `400` | Debounced save delay |
 
-## Changelog (v0.3.0 → v0.6.2)
+## Changelog (v0.3.0 → v0.6.5)
+
+### v0.6.5 — Permanent save-block after deletion fix
+
+- **Ratchet floor on legitimate deletions.** `_dbSceneElementCount` is now ratcheted down when the entire element drop is explained by tracked deletions — prevents `_flushPanelSession` from permanently refusing saves after a real delete.
+- **Real deletion detection.** Replaced the dead `appState?.deletedIds` check (Excalidraw has no such field) with an id-diff heuristic (`_lastSeenLiveIds` vs `currentLiveIds`) matching the broadcast code's proven approach.
+- **DB-aware guard runs perpetually** — no longer disabled after the first healthy load. Floor is updated after every load, reload, WS merge, and save.
+- **Legacy-row empty-override** — content-aware `_pickNewerDoc` now also guards against stale/empty legacy Plugin Backend rows, not just localStorage.
+- **WS merge floor sync** — `_dbSceneElementCount` and `_lastSeenLiveIds` are updated after remote delta merges so deletions from other tabs don't poison local save guard.
+- **Version tag in status bar** — `v0.6.5` shown in the panel footer for at-a-glance version identification.
 
 ### v0.6.2 — LocalStorage poisoning fix, DB-wins merge, WS delta guard
 
