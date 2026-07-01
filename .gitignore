@@ -2,3 +2,5 @@ node_modules/
 dist/
 .thymer-debug-profile*
 *.log
+scripts/
+tests/
