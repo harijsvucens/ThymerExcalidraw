@@ -2426,7 +2426,7 @@ const EXCAL_PLUGIN_ID = 'excalidraw';
 const EXCAL_MODE_KEY = 'thymerext_ps_mode_excalidraw';
 const EXCAL_DRAW_PREFIX = 'excal_draw_v1_';
 const EXCAL_PANEL_TYPE = 'excalidraw-editor';
-const EXCAL_VERSION = '0.6.0';
+const EXCAL_VERSION = '0.6.1';
 const EXCAL_ICON = 'ti-palette';
 const EXCAL_FRAME_PAD_X = 12;
 const EXCAL_FRAME_PAD_TOP = 28;
@@ -2523,7 +2523,60 @@ function excalDrawingsCollectionShape() {
   };
 }
 
-// v0.5.6: shallow-clone an element for use as a delta-filter snapshot.
+// v0.6.1: cheap scene signature for the mount-echo guard. Returns a
+// stable string that is identical for two scenes with the same set
+// of element ids, and different when the user adds, removes, or
+// replaces an element. The Excalidraw mount fires onChange with
+// empty `elements` first, then re-fires after initialData is applied
+// — the second fire carries the same ids as the snapshot, so the
+// signature comparison in the onChange handler recognises it as an
+// echo of the initial commit and skips the autosave.
+//
+// We use length + sorted ids (not JSON.stringify of full elements)
+// because Excalidraw normalises some fields (e.g. groupIds defaults
+// to []) between the first and second mount-time onChange fires.
+// The id set is stable across that normalisation. A real user edit
+// (add/remove/import) changes the id set; a real content edit
+// (move/resize) keeps the id set but bumps element versions — both
+// cases should still be saveable. To make sure version-only edits
+// are also saveable, the guard combines the signature match with
+// a check that the live version hasn't bumped (see onChange handler).
+function _excalSceneSignature(elements) {
+  if (!Array.isArray(elements) || elements.length === 0) return '';
+  const ids = [];
+  for (let i = 0; i < elements.length; i++) {
+    const el = elements[i];
+    if (el && el.id != null) ids.push(String(el.id));
+  }
+  ids.sort();
+  return `${ids.length}:${ids.join('|')}`;
+}
+
+// v0.6.1: count non-deleted elements in a serialized scene (the shape
+// returned by _serializeScene). Used by _flushPanelSession to refuse
+// to write an empty scene on top of a non-empty initial record. The
+// scene can be either `{ sceneJson: '<json string>' }` (React save
+// path) or `{ elements, appState, files }` (fallback path). Returns
+// -1 if it cannot determine the count (caller should treat as "not
+// empty" — i.e. allow the save).
+function _excalSerializedElementCount(pendingScene) {
+  if (!pendingScene || typeof pendingScene !== 'object') return -1;
+  if (Array.isArray(pendingScene.elements)) {
+    return pendingScene.elements.filter((e) => e && !e.isDeleted).length;
+  }
+  if (typeof pendingScene.sceneJson === 'string') {
+    try {
+      const parsed = JSON.parse(pendingScene.sceneJson);
+      const els = Array.isArray(parsed?.elements) ? parsed.elements : [];
+      return els.filter((e) => e && !e.isDeleted).length;
+    } catch (_) {
+      return -1;
+    }
+  }
+  return -1;
+}
+
+// v0.6.1: shallow-clone an element for use as a delta-filter snapshot.
 // Excalidraw mutates element objects in place; storing the live reference
 // causes the delta filter to always see prevEl.version === el.version
 // (same object) and emit an empty delta. Cloning the array-valued fields
@@ -3805,7 +3858,33 @@ class Plugin extends AppPlugin {
       onChange: (elements, appState, files) => {
         plugin._syncStageTheme(session, appState?.theme);
         const echoSuppressed = session.applyingRemoteUpdate || (Date.now() - (session.lastRemoteApplyMs || 0) < EXCAL_ECHO_GUARD_MS);
-        if (!echoSuppressed) {
+        // v0.6.1: two extra guards layered on top of the 500ms echo
+        // window (see DEBUG.md §5.13).
+        //  - mountEcho: the scene matches the snapshot taken right
+        //    after initialData was applied. This is Excalidraw's
+        //    post-mount re-commit, not a user edit.
+        //  - emptyOverPopulated: the loaded scene was non-empty, and
+        //    the live scene is empty with no deletion IDs — a
+        //    regression, never a user action. We refuse to write this
+        //    so the autosave can never blank out populated data.
+        const liveSig = _excalSceneSignature(elements);
+        const mountEcho = !!session._initialSceneSignature
+          && liveSig === session._initialSceneSignature
+          && elements.length > 0;
+        const emptyOverPopulated = session._hadNonEmptyInitialData === true
+          && elements.length === 0
+          && (!Array.isArray(appState?.deletedIds) || appState.deletedIds.length === 0)
+          && session.lastBroadcastElements
+          && session.lastBroadcastElements.size > 0;
+        const saveSuppressed = emptyOverPopulated;
+        const broadcastSuppressed = echoSuppressed || mountEcho;
+        if (mountEcho) {
+          console.log(`[${EXCAL_PLUGIN_NAME}] DIAG: mount-echo suppressed (scene signature matches loaded initial scene, ${elements.length} els)`);
+        }
+        if (emptyOverPopulated) {
+          console.warn(`[${EXCAL_PLUGIN_NAME}] DIAG: empty-over-populated save REFUSED (initial had ${session.lastBroadcastElements?.size ?? '?'} els, live has 0). See DEBUG.md §5.13.`);
+        }
+        if (!echoSuppressed && !mountEcho && !saveSuppressed) {
           session.pendingScene = plugin._serializeScene(session.excalLib, elements, appState, files);
           session.dirty = true;
           plugin._setPanelStatus(session, 'Unsaved changes');
@@ -3814,8 +3893,8 @@ class Plugin extends AppPlugin {
             void plugin._flushPanelSession(false);
           }, plugin._autosaveMs);
         }
-        console.log(`[${EXCAL_PLUGIN_NAME}] DIAG: onChange ${elements.length} els, applyingRemote=${session.applyingRemoteUpdate} echoSuppressed=${echoSuppressed}`);
-        if (!echoSuppressed) {
+        console.log(`[${EXCAL_PLUGIN_NAME}] DIAG: onChange ${elements.length} els, applyingRemote=${session.applyingRemoteUpdate} echoSuppressed=${echoSuppressed} mountEcho=${mountEcho} emptyOverPopulated=${emptyOverPopulated} EXCAL_VERSION=${EXCAL_VERSION}`);
+        if (!echoSuppressed && !broadcastSuppressed) {
           plugin._scheduleWsBroadcast(session, elements);
         }
       },
@@ -4359,7 +4438,22 @@ class Plugin extends AppPlugin {
       saveInFlight: false,
       excalApi: null,
       applyingRemoteUpdate: false,
-      lastRemoteApplyMs: 0,
+      // v0.6.1: seed lastRemoteApplyMs to NOW so the 500ms echo guard
+      // fires during the initial mount window. Excalidraw's first-wave
+      // onChange events fire with empty elements before initialData is
+      // applied; the previous init of 0 made the guard
+      // `Date.now() - 0 < 500` trivially false, so those echoes
+      // were treated as real edits and the autosave wrote an empty
+      // scene over populated data.
+      lastRemoteApplyMs: Date.now(),
+      // v0.6.1: track whether the loaded scene was non-empty so the
+      // onChange handler (and the pagehide flush) can refuse to write
+      // an empty scene on top of populated data. See DEBUG.md §5.13.
+      _hadNonEmptyInitialData: false,
+      // v0.6.1: signature of the loaded scene (length + sorted ids).
+      // onChange events whose scene matches this signature are echoes
+      // of the initial commit, not user edits — skip the save.
+      _initialSceneSignature: null,
       wsUnsub: null,
       recordUpdateEventId: null,
       reloadEventId: null,
@@ -4499,6 +4593,16 @@ class Plugin extends AppPlugin {
       const initialData = this._buildInitialData(doc, bundle.lib);
       this._syncStageTheme(session, initialData?.appState?.theme);
       const hasContent = this._sceneDocHasContent(doc);
+
+      // v0.6.1: snapshot the initial scene so the onChange handler can
+      // detect echoes of the initial commit and skip the save. See
+      // DEBUG.md §5.13. Only set when the loaded scene was non-empty —
+      // a truly empty drawing should autosave normally as the user
+      // starts drawing.
+      if (initialData && Array.isArray(initialData.elements) && initialData.elements.length > 0) {
+        session._hadNonEmptyInitialData = true;
+        session._initialSceneSignature = _excalSceneSignature(initialData.elements);
+      }
 
       const { React, createRoot, Excalidraw } = bundle;
       const rootEl = createRoot(host);
@@ -5519,6 +5623,24 @@ class Plugin extends AppPlugin {
     if (!session.dirty && !force) return;
     if (!session.pendingScene && !force) return;
     if (session.saveInFlight) return;
+
+    // v0.6.1: refuse to write an empty scene on top of a non-empty
+    // initial. The onChange handler already blocks this, but the
+    // pagehide/visibilitychange/panel-closed flush paths call here
+    // with force=true and could otherwise bypass the guard if a
+    // future regression re-introduces a way to set pendingScene to
+    // an empty state (DEBUG.md §5.13).
+    if (session._hadNonEmptyInitialData === true && session.pendingScene) {
+      const elCount = _excalSerializedElementCount(session.pendingScene);
+      if (elCount === 0) {
+        console.warn(
+          `[${EXCAL_PLUGIN_NAME}] _flushPanelSession: refused to write empty scene (force=${!!force}); keeping populated DB record. EXCAL_VERSION=${EXCAL_VERSION}`,
+        );
+        session.dirty = false;
+        session.pendingScene = null;
+        return;
+      }
+    }
 
     session.saveInFlight = true;
     this._setPanelStatus(session, 'Saving…');

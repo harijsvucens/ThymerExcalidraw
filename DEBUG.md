@@ -476,6 +476,95 @@ installed but the count is 0 when a right-click happens,
 the event isn't reaching the shell — check that the
 click is genuinely inside the panel.
 
+### 5.13 — Excalidraw's first onChange events fire with empty elements (v0.6.1)
+
+This is the **mount-echo data-loss bug** the user reported
+2026-07-01. Symptom: open a panel for a note that already has
+drawing data; the autosave (or a pagehide / visibilitychange
+flush) writes `elements:[]` to the DB and the localStorage
+mirror, blanking out the user's work. The data is only
+recoverable if a different browser still has a stale
+localStorage mirror, or via Thymer's per-record version
+history (📋 Show Data button, shipped in v0.6.0).
+
+**Why it happens.** Excalidraw (the React `<Excalidraw>` mount
+path) fires `onChange` with `elements: []` *while it's still
+bootstrapping* — *before* `initialData` is applied. After
+`initialData` lands, it fires `onChange` again with the
+loaded elements. The pre-v0.6.1 plugin treated both waves as
+real edits and set `pendingScene` to whatever was in
+`elements`, so the 400ms autosave debounce (or a quick
+pagehide) wrote the empty scene.
+
+The onChange handler's echo guard
+(`Date.now() - (lastRemoteApplyMs || 0) < EXCAL_ECHO_GUARD_MS`)
+was supposed to suppress this, but `lastRemoteApplyMs` was
+initialised to `0`, so the guard
+`Date.now() - 0 < 500` is trivially false. The guard only
+ever fired for echoes of *remote* updates, never for the
+mount's own onChange.
+
+**Smoke-test pattern** — open the console, filter for
+`DIAG: onChange` while opening a fresh panel:
+
+```
+[Excalidraw] DIAG: onChange 0 els, applyingRemote=false echoSuppressed=false   ← bad
+[Excalidraw] DIAG: onChange 0 els, applyingRemote=false echoSuppressed=false   ← bad
+[Excalidraw] DIAG: onChange 0 els, applyingRemote=false echoSuppressed=false   ← bad
+[Excalidraw] DIAG: onChange 10 els, applyingRemote=false echoSuppressed=false  ← loaded
+```
+
+Post-v0.6.1 the first three lines should show
+`echoSuppressed=true` (Layer 1), or `mountEcho=true` (Layer
+2), or in the worst case the autosave refuses to write
+because of Layer 3. The four-line baseline in
+`tests/baseline/T1T3-baseline.json` is the canonical
+reproducer.
+
+**Fix in v0.6.1 (three layers, defense in depth):**
+
+1. **Layer 1 — seed `lastRemoteApplyMs` to `Date.now()`** in
+   `_openDrawingPanelWithSession`. The existing 500ms echo
+   guard now actually fires at mount. Catches the typical
+   case where Excalidraw's first-wave onChange events all
+   land within ~100ms of the panel mount.
+2. **Layer 2 — initial-scene signature** snapshot taken
+   right after `_buildInitialData` in `_mountDrawingPanel`.
+   In the onChange handler, if the live scene's id
+   signature (`length + sorted ids`) matches the loaded
+   signature, skip the save. Catches echoes that arrive
+   after the 500ms window expires (e.g. slow CDN load,
+   large UMD bundle).
+3. **Layer 3 — empty-over-populated hard block.** When
+   `session._hadNonEmptyInitialData === true` and the live
+   scene has 0 elements with no `deletedIds`, refuse the
+   save unconditionally and `console.warn`. The same guard
+   is mirrored in `_flushPanelSession` so the pagehide /
+   visibilitychange / `panel.closed` force-flush paths
+   cannot bypass it. This is the strongest layer — even if
+   Layers 1+2 regress, an empty scene will never overwrite
+   populated data.
+
+**Diagnostic pattern** if a "blank canvas on open" bug
+returns in the future:
+
+```js
+// In the page console, on opening a panel that already has data:
+const panel = document.querySelector('.excal-panel-shell');
+const session = panel?.__excalSession; // if exposed
+const db = await fetch('/api/...').then(r => r.json());
+const live = session?.excalApi?.getSceneElements();
+console.log('DB:', db?.scene?.sceneJson?.length, 'LIVE:', live?.length);
+// If DB > 0 and LIVE === 0: mount-echo regression
+```
+
+Or — more pragmatically — filter the console for
+`empty-over-populated` after opening a populated panel.
+A `console.warn` of that form means the guard caught an
+attempted data-bleach; the DB should be intact. A
+`console.warn` of the form `mount-echo suppressed` is
+normal and expected.
+
 ### 5.12 — The save format and the load format don't match (bug 9, v0.5.8 root cause)
 
 This is the most expensive misdiagnosis in the v0.5.x line —

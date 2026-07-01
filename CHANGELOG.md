@@ -1,5 +1,101 @@
 # ThymerExcalidraw Changelog
 
+## 0.6.1 — 2026-07-01
+
+### Fixed (panel-open could overwrite populated drawing with empty scene)
+
+- **Root cause.** When a user opened an Excalidraw panel for a note
+  that already had drawing data, the plugin's autosave sometimes
+  wrote `elements:[]` to both the database and the localStorage
+  mirror, blanking out the user's real work. Symptom reported
+  2026-07-01: opened the "Wed Jul 1 · Excalidrawing" record, the
+  saved scene had `updatedAt: 2026-07-01T14:34:02.885Z` with
+  zero elements, even though the user had been drawing on it.
+  Data was only restored because Firefox still had a stale
+  localStorage mirror from an earlier session.
+- **Why the existing 500ms echo guard didn't catch it.** The
+  onChange handler computes
+  `echoSuppressed = session.applyingRemoteUpdate
+    || (Date.now() - (session.lastRemoteApplyMs || 0) < EXCAL_ECHO_GUARD_MS)`.
+  `lastRemoteApplyMs` was initialised to `0` in
+  `_openDrawingPanelWithSession`, so at mount
+  `Date.now() - 0` is a huge number — not `< 500`. The guard
+  only ever fired for echoes of *remote* updates, never for
+  Excalidraw's own initial-mount onChange. **Fix (Layer 1):**
+  seed `lastRemoteApplyMs: Date.now()` in the session init.
+- **Excalidraw's first onChange events fire with empty
+  `elements`**, before `initialData` is applied. The probe in
+  `tests/baseline/T1T3-baseline.json` shows the pattern:
+  `DIAG: onChange 0 els, applyingRemote=false echoSuppressed=false`
+  fires 4 times in a row at the start of every test, then the
+  loaded scene arrives. The 500ms guard expires (e.g. on slow
+  CDN loads) and the autosave writes the empty scene.
+  **Fix (Layer 2):** snapshot the loaded scene's id signature
+  (`length + sorted ids` via `_excalSceneSignature`) after
+  `_buildInitialData`; in the onChange handler, skip the save
+  if the new scene's signature matches.
+- **Belt-and-suspenders (Layer 3).** Even with Layers 1+2, a
+  regression could let an empty scene reach `pendingScene`.
+  When `_hadNonEmptyInitialData === true` and the live scene
+  has 0 elements with no deletion IDs, refuse the save
+  unconditionally. The same guard is mirrored in
+  `_flushPanelSession` so the pagehide / visibilitychange /
+  panel-closed force-flush paths can't bypass it either.
+- New helpers at module level:
+  - `_excalSceneSignature(elements)` — stable hash for echo
+    detection.
+  - `_excalSerializedElementCount(pendingScene)` — counts
+    non-deleted elements in either the v3 `{ sceneJson: ... }`
+    shape or the fallback `{ elements, appState, files }` shape.
+    Returns `-1` when the count can't be determined (treated as
+    "not empty" so we never silently drop a real save).
+- New session fields (initialised in `_openDrawingPanelWithSession`):
+  - `_hadNonEmptyInitialData: boolean` — true iff the loaded
+    scene had at least one non-deleted element.
+  - `_initialSceneSignature: string|null` — see Layer 2.
+- Bumped `EXCAL_VERSION` to `0.6.1` and `plugin.json` version
+  to `0.6.1`.
+
+### Live verification (browser-driven, fresh Chrome Dev Test6)
+
+- Reverted Wed Jul 1's `1JC9C44WQDVD19JFXBM8PYQJ74` to its
+  populated state (10 elements, `updatedAt:
+  2026-07-01T14:39:33.724Z`).
+- Opened the source note "Wed Jul 1"
+  (`S-16S1WSXAWSHVHJZ72G6J3JRTCP-P000000000-0-20260701`) in
+  Harry's workspace (`W6CDWK9CQRRWPJV2K5SM9YSW6P`).
+- Command palette → "Excalidraw: Open drawing for this note"
+  → panel mounted, 3-second wait with no user input, closed
+  panel.
+- Post-test `thymer_get_record` on `1JC9C44WQDVD19JFXBM8PYQJ74`:
+  `elements.length` still 10, `updatedAt` unchanged. The page
+  console showed the new probe line
+  `DIAG: onChange N els, ... echoSuppressed=true mountEcho=...`
+  for the initial-mount onChange events (echo guard now
+  firing), and zero `DIAG: empty-over-populated save REFUSED`
+  warnings (the live scene was non-empty throughout).
+- New regression test `tests/sync/T10-mount-echo.mjs`:
+  asserts the same property. Pre-v0.6.1 the test would have
+  failed (the DB would have flipped to empty); post-v0.6.1
+  the test passes.
+- Re-ran `tests/sync/T9-close-reopen.mjs` and
+  `T1T3-baseline.mjs`: no regression. The pagehide flush
+  still saves real edits (the freedraw baseline test draws,
+  closes, reopens, and reads back the full geometry).
+
+### Diagnostic
+
+- The `EXCAL_VERSION` log line in the page console now shows
+  `0.6.1`. A stale service-worker cache or wrong workspace
+  would show `0.6.0` or earlier — re-check `THYMER_WS_GUID`
+  and hot-reload.
+- The mount-echo guard's onChange probe line now includes
+  `mountEcho=...` and `emptyOverPopulated=...` fields. A
+  cluster of `mountEcho=true` lines at panel-open is normal
+  (Excalidraw's first-wave onChange events). An
+  `emptyOverPopulated=true` line is a *bug* — it would mean
+  the autosave tried to blank out populated data.
+
 ## 0.6.0 — 2026-06-30
 
 ### Added (Show Data button in Excalidraw panel)
