@@ -49,7 +49,28 @@ Legacy drawings in **Plugin Backend** (`record_kind` = `drawing`) are still **re
 | `cdnVersion` | `0.17.6` | Pin `@excalidraw/excalidraw` UMD version |
 | `autosaveMs` | `1500` | Debounced save delay (minimum 800) |
 
-## Changelog (v0.3.0 → v0.5.8)
+## Changelog (v0.3.0 → v0.6.2)
+
+### v0.6.2 — LocalStorage poisoning fix, DB-wins merge, WS delta guard
+
+- **DB always wins over empty localStorage.** `_pickNewerDoc` is now content-aware: if DB has non-empty elements and localStorage is empty, DB wins regardless of `updatedAt`. Poisons (stale empty entries from pre-v0.6.1) can no longer blank the canvas on load.
+- **Heal poisoned localStorage on load.** After a DB load, the DB doc is written back to localStorage, clearing stale empty entries.
+- **Block WS deltas when load failed.** If `session.drawingRecordGuid` is null, skip the delta and trigger `_reloadDrawingDoc` instead, preventing partial-scene accumulation on a blank canvas.
+- **DB-aware save guard (Layer 4).** Compare live element count against `_dbSceneElementCount` — if fewer elements with no explicit deletions, refuse the save. The strongest data-loss prevention.
+- **WS filter also matches `drawingRecordGuid`.** Cross-tab sync works even when the source-record filter doesn't cover it.
+- Tests: T11 (localStorage poisoning), T12 (cross-tab partial-save guard), T13 (DB-wins reconciliation), T14 (load fail + WS delta). Probe line: `DIAG: onChange N els, ... dbAwareBlocked=...`.
+
+### v0.6.1 — Mount-echo data loss fix (3-layer defense)
+
+- **Layer 1:** Seed `lastRemoteApplyMs: Date.now()` in session init so the 500ms echo guard fires for Excalidraw's own initial-mount onChange events (not just remote updates).
+- **Layer 2:** Snapshot scene id signature after `_buildInitialData`; skip save if new scene's signature matches the loaded one.
+- **Layer 3:** When `_hadNonEmptyInitialData === true` and live scene has 0 elements with no deletions, refuse the save unconditionally. Mirrored in `_flushPanelSession`.
+- New helpers: `_excalSceneSignature`, `_excalSerializedElementCount`.
+- T10 mount-echo regression test passes.
+
+### v0.6.0 — Show Data button
+
+- **"Show Data" button** (`📋`) in the Excalidraw panel opens the raw drawing record in a new panel with Thymer version history accessible.
 
 ### v0.5.8 — Scene load bugfix & diagnostics
 - **Fixed blank canvas on reload**: v3 save format (`doc.scene.sceneJson`) was never parsed by `_buildInitialData` — the function returned `null` on every load, so Excalidraw always started empty. Added a third branch that parses the nested JSON string through `lib.restore()`.
