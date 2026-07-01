@@ -2426,7 +2426,7 @@ const EXCAL_PLUGIN_ID = 'excalidraw';
 const EXCAL_MODE_KEY = 'thymerext_ps_mode_excalidraw';
 const EXCAL_DRAW_PREFIX = 'excal_draw_v1_';
 const EXCAL_PANEL_TYPE = 'excalidraw-editor';
-const EXCAL_VERSION = '0.6.1';
+const EXCAL_VERSION = '0.6.2';
 const EXCAL_ICON = 'ti-palette';
 const EXCAL_FRAME_PAD_X = 12;
 const EXCAL_FRAME_PAD_TOP = 28;
@@ -3876,13 +3876,28 @@ class Plugin extends AppPlugin {
           && (!Array.isArray(appState?.deletedIds) || appState.deletedIds.length === 0)
           && session.lastBroadcastElements
           && session.lastBroadcastElements.size > 0;
-        const saveSuppressed = emptyOverPopulated;
+        // v0.6.2: Layer 4 — DB-aware guard. If the live scene has fewer
+        // non-deleted elements than the DB scene (and no explicit deletions),
+        // refuse the save. This prevents partial-scene overwrite when the
+        // load returned empty from poisoned localStorage but WS deltas from
+        // another tab have been applied.
+        const liveNonDeleted = Array.isArray(elements)
+          ? elements.filter((e) => e && !e.isDeleted).length : 0;
+        const dbCount = session._dbSceneElementCount || 0;
+        const dbAwareBlocked = dbCount > 0
+          && liveNonDeleted < dbCount
+          && (!Array.isArray(appState?.deletedIds) || appState.deletedIds.length === 0)
+          && session._hadNonEmptyInitialData !== true;
+        const saveSuppressed = emptyOverPopulated || dbAwareBlocked;
         const broadcastSuppressed = echoSuppressed || mountEcho;
         if (mountEcho) {
           console.log(`[${EXCAL_PLUGIN_NAME}] DIAG: mount-echo suppressed (scene signature matches loaded initial scene, ${elements.length} els)`);
         }
         if (emptyOverPopulated) {
           console.warn(`[${EXCAL_PLUGIN_NAME}] DIAG: empty-over-populated save REFUSED (initial had ${session.lastBroadcastElements?.size ?? '?'} els, live has 0). See DEBUG.md §5.13.`);
+        }
+        if (dbAwareBlocked) {
+          console.warn(`[${EXCAL_PLUGIN_NAME}] DIAG: db-aware save REFUSED (DB has ${dbCount} els, live has ${liveNonDeleted}). See DEBUG.md §5.14.`);
         }
         if (!echoSuppressed && !mountEcho && !saveSuppressed) {
           session.pendingScene = plugin._serializeScene(session.excalLib, elements, appState, files);
@@ -3893,7 +3908,7 @@ class Plugin extends AppPlugin {
             void plugin._flushPanelSession(false);
           }, plugin._autosaveMs);
         }
-        console.log(`[${EXCAL_PLUGIN_NAME}] DIAG: onChange ${elements.length} els, applyingRemote=${session.applyingRemoteUpdate} echoSuppressed=${echoSuppressed} mountEcho=${mountEcho} emptyOverPopulated=${emptyOverPopulated} EXCAL_VERSION=${EXCAL_VERSION}`);
+        console.log(`[${EXCAL_PLUGIN_NAME}] DIAG: onChange ${elements.length} els, applyingRemote=${session.applyingRemoteUpdate} echoSuppressed=${echoSuppressed} mountEcho=${mountEcho} emptyOverPopulated=${emptyOverPopulated} dbAwareBlocked=${dbAwareBlocked} EXCAL_VERSION=${EXCAL_VERSION}`);
         if (!echoSuppressed && !broadcastSuppressed) {
           plugin._scheduleWsBroadcast(session, elements);
         }
@@ -4450,6 +4465,9 @@ class Plugin extends AppPlugin {
       // onChange handler (and the pagehide flush) can refuse to write
       // an empty scene on top of populated data. See DEBUG.md §5.13.
       _hadNonEmptyInitialData: false,
+      // v0.6.2: element count from the DB at load time, so the save
+      // guard can refuse to write a partial scene over populated DB data.
+      _dbSceneElementCount: 0,
       // v0.6.1: signature of the loaded scene (length + sorted ids).
       // onChange events whose scene matches this signature are echoes
       // of the initial commit, not user edits — skip the save.
@@ -4602,6 +4620,15 @@ class Plugin extends AppPlugin {
       if (initialData && Array.isArray(initialData.elements) && initialData.elements.length > 0) {
         session._hadNonEmptyInitialData = true;
         session._initialSceneSignature = _excalSceneSignature(initialData.elements);
+      }
+
+      // v0.6.2: heal poisoned localStorage. If the loaded doc has content,
+      // write it to localStorage so stale empty entries from pre-v0.6.1
+      // mount-echo bleaches are overwritten. See DEBUG.md §5.14.
+      if (doc && this._sceneDocHasContent(doc)) {
+        try {
+          localStorage.setItem(this._localDrawKey(session.recordGuid), JSON.stringify(doc));
+        } catch (_) {}
       }
 
       const { React, createRoot, Excalidraw } = bundle;
@@ -4900,6 +4927,22 @@ class Plugin extends AppPlugin {
     return (scene.elements || []).some((x) => x && !x.isDeleted);
   }
 
+  _countDocNonDeleted(doc) {
+    if (!doc) return 0;
+    try {
+      if (doc.shareHash) return 0;
+      if (doc.sceneJson) {
+        const parsed = typeof doc.sceneJson === 'string' ? JSON.parse(doc.sceneJson) : doc.sceneJson;
+        return (parsed?.elements || []).filter((x) => x && !x.isDeleted).length;
+      }
+      if (doc.scene?.sceneJson) {
+        const parsed = typeof doc.scene.sceneJson === 'string' ? JSON.parse(doc.scene.sceneJson) : doc.scene.sceneJson;
+        return (parsed?.elements || []).filter((x) => x && !x.isDeleted).length;
+      }
+      return (doc.scene?.elements || []).filter((x) => x && !x.isDeleted).length;
+    } catch (_) { return 0; }
+  }
+
   _pickNewerDoc(a, b) {
     if (!a) return b || null;
     if (!b) return a;
@@ -5074,7 +5117,43 @@ class Plugin extends AppPlugin {
       if (raw && String(raw).trim()) fromLocal = JSON.parse(raw);
     } catch (_) {}
 
-    return this._pickNewerDoc(fromCollection, this._pickNewerDoc(fromRow, fromLocal));
+    // v0.6.2: content-aware merge. If the DB has content and localStorage
+    // is empty, the DB wins regardless of updatedAt (prevents stale empty
+    // localStorage from pre-v0.6.1 mount-echo bleaches from blanking the
+    // canvas). See DEBUG.md §5.14.
+    const picked = this._pickNewerDoc(fromCollection, this._pickNewerDoc(fromRow, fromLocal));
+    const session = this._panelSession;
+    const dbCount = fromCollection ? this._countDocNonDeleted(fromCollection) : 0;
+    if (session && session.recordGuid === recordGuid) {
+      session._dbSceneElementCount = dbCount;
+    }
+    if (fromCollection && this._sceneDocHasContent(fromCollection)) {
+      if (picked === fromLocal && !this._sceneDocHasContent(fromLocal)) {
+        console.log(`[${EXCAL_PLUGIN_NAME}] DB-wins: collection has content but localStorage is empty; using collection doc`);
+        return fromCollection;
+      }
+    }
+    return picked;
+  }
+
+  async _reloadDrawingDoc(session) {
+    if (!session?.recordGuid || !session?.excalApi) return;
+    const doc = await this._loadDrawingDoc(session.recordGuid);
+    if (!doc) return;
+    const initialData = this._buildInitialData(doc, session.excalLib);
+    if (!initialData || !Array.isArray(initialData.elements) || !initialData.elements.length) return;
+    session.applyingRemoteUpdate = true;
+    session.lastRemoteApplyMs = Date.now();
+    try {
+      session.excalApi.updateScene({ elements: initialData.elements });
+    } catch (e) {
+      console.warn(`[${EXCAL_PLUGIN_NAME}] reload scene`, e);
+    }
+    session.applyingRemoteUpdate = false;
+    const elCount = initialData.elements.filter((e) => e && !e.isDeleted).length;
+    session._dbSceneElementCount = elCount;
+    session._initialSceneSignature = _excalSceneSignature(initialData.elements);
+    session._hadNonEmptyInitialData = elCount > 0;
   }
 
   _parseLegacyDrawingDoc(row) {
@@ -5406,7 +5485,16 @@ class Plugin extends AppPlugin {
       console.log(`[${EXCAL_PLUGIN_NAME}] [${session._instanceTag || session.senderId}] DIAG: WS self-msg filtered out (senderId matches my session)`);
       return;
     }
-    if (data.drawingGuid !== session.recordGuid) return;
+    // v0.6.2: also match on drawingRecordGuid so cross-tab sync
+    // arrives even when the source-record filter would not cover it.
+    if (data.drawingGuid !== session.recordGuid && data.drawingGuid !== session.drawingRecordGuid) return;
+    // v0.6.2: if the load failed (no drawingRecordGuid), don't apply
+    // partial WS deltas to a blank canvas — trigger a re-load instead.
+    if (!session.drawingRecordGuid) {
+      console.warn(`[${EXCAL_PLUGIN_NAME}] WS delta recv but drawingRecordGuid is null; re-loading drawing doc`);
+      this._reloadDrawingDoc(session);
+      return;
+    }
     if (!data.elements?.length && !data.deletedIds?.length) {
       console.log(`[${EXCAL_PLUGIN_NAME}] DIAG: WS msg passed filters but empty content`);
       return;
@@ -5635,6 +5723,20 @@ class Plugin extends AppPlugin {
       if (elCount === 0) {
         console.warn(
           `[${EXCAL_PLUGIN_NAME}] _flushPanelSession: refused to write empty scene (force=${!!force}); keeping populated DB record. EXCAL_VERSION=${EXCAL_VERSION}`,
+        );
+        session.dirty = false;
+        session.pendingScene = null;
+        return;
+      }
+    }
+
+    // v0.6.2: DB-aware flush guard. If the pending scene has fewer
+    // elements than the DB and no explicit deletions, refuse the save.
+    if (session._dbSceneElementCount > 0 && session.pendingScene && session._hadNonEmptyInitialData !== true) {
+      const pendingCount = _excalSerializedElementCount(session.pendingScene);
+      if (pendingCount < session._dbSceneElementCount && pendingCount >= 0) {
+        console.warn(
+          `[${EXCAL_PLUGIN_NAME}] _flushPanelSession: DB-aware guard refused save (DB has ${session._dbSceneElementCount} els, pending has ${pendingCount}). EXCAL_VERSION=${EXCAL_VERSION}`,
         );
         session.dirty = false;
         session.pendingScene = null;

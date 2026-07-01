@@ -109,13 +109,24 @@ async function readDbScene(workspaceGuid, drawingRecordGuid) {
 }
 
 async function openSourceRecordViaSidebar(page) {
-  // Navigate directly to the journal entry and let the panel settle
+  // First navigate to home so the Thymer app loads without triggering the
+  // Chrome "thymer://" protocol handler popup (DEBUG.md §5.4).
+  await page.goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(4000);
+  // Then navigate in-page via evaluate to bypass the protocol handler.
+  // The ?open= deep-link triggers Thymer to auto-navigate to the journal
+  // entry AND auto-mount the Excalidraw panel (via _schedulePanelChrome).
   const url = HOME_URL + '?open=' + WS + '.' + SRC_RECORD_GUID + '#Wed-Jul-1';
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(5000);
+  await page.evaluate((u) => { window.location.href = u; }, url);
+  await page.waitForTimeout(8000);
 }
 
 async function openExcalPanel(page) {
+  // The ?open= deep-link auto-mounts the Excalidraw panel, so the palette
+  // command may not be needed. But wait and check — if the panel didn't
+  // auto-mount, try the command palette as a fallback.
+  const existing = await waitForExcalSession(page, 5000);
+  if (existing) return;
   // Click the page body to ensure keyboard focus
   await page.mouse.click(400, 300);
   await page.waitForTimeout(300);
@@ -125,7 +136,6 @@ async function openExcalPanel(page) {
   // Check palette opened
   const hasPalette = await page.evaluate(() => !!document.querySelector('.cmdpal--input'));
   if (!hasPalette) {
-    // Try alternative shortcut
     await page.keyboard.press('Control+Shift+p');
     await page.waitForTimeout(1000);
   }
@@ -277,7 +287,7 @@ async function run() {
     console.error('[FAIL]', verdict);
     process.exitCode = 1;
   } else {
-    console.log('[PASS] v0.6.1 mount-echo fix verified.');
+    console.log('[PASS] v0.6.2 mount-echo fix verified.');
   }
 
   await browser.close();

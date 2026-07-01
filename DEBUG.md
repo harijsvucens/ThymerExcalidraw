@@ -683,6 +683,71 @@ If the dump shows `"sceneJson": "..."` (nested under
 `scene`), the function is in the broken pre-v0.5.8
 state and needs the `scene.sceneJson` branch added.
 
+### 5.14 — Stale empty localStorage can override populated DB (v0.6.2)
+
+This is the data-loss gotcha the v0.6.2 fix targets. The user
+reports "A shows blank canvas; B's moves appear on A." The chain:
+
+1. A and B share localStorage (same origin, same browser).
+2. Before v0.6.1, the mount-echo bug wrote `elements:[]` to both
+   the DB and localStorage. v0.6.1 prevents new bleaches, but
+   existing stale empty localStorage entries persist.
+3. `_loadDrawingDoc` reads three sources and picks the newest by
+   `updatedAt` (line 5077, pre-v0.6.2). A stale empty localStorage
+   entry with a newer `updatedAt` than the DB wins — canvas loads
+   blank.
+4. The WS subscription (`_handleIncomingWsMessage`, line 5409)
+   filters by `session.recordGuid` (the source note), so A still
+   receives B's WS deltas. Moved objects appear on A's blank
+   canvas.
+5. A's autosave fires, writing the partial scene (B's delta only)
+   to the DB — overwriting the populated scene.
+
+**Fix stack in v0.6.2 (five layers, defense in depth):**
+
+1. **Fix 1 — Content-aware merge** (`_loadDrawingDoc`, line 5100).
+   If the DB has non-empty elements and localStorage is empty, the
+   DB wins regardless of `updatedAt`. Stops the blank-on-load at
+   the source.
+2. **Fix 2 — Heal poisoned localStorage** (`_mountDrawingPanel`,
+   line 4613). After a successful load, write the DB doc back to
+   localStorage. Clears poisoned entries for every subsequent load
+   on that browser.
+3. **Fix 3 — Block WS deltas when load failed**
+   (`_handleIncomingWsMessage`, line 5428). If
+   `session.drawingRecordGuid` is null (load returned empty),
+   skip the delta and call `_reloadDrawingDoc` instead. Prevents
+   partial-scene accumulation on a blank canvas.
+4. **Fix 4 — DB-aware save guard** (onChange handler line 3899,
+   `_flushPanelSession` line 5735). Compare live element count
+   against `session._dbSceneElementCount` (tracked from the DB at
+   load time). If the live scene has fewer elements and no explicit
+   deletions, refuse the save. This is the strongest layer — even
+   if all other layers regress, a partial scene can never overwrite
+   the populated DB.
+5. **Fix 5 — WS filter also matches `drawingRecordGuid`** (line
+   5425). The WS filter now checks both `session.recordGuid` and
+   `session.drawingRecordGuid`, ensuring cross-tab sync arrives
+   in all cases.
+
+**Diagnostic pattern** if a "blank canvas on A, B's moves appear
+on A" bug returns:
+
+```js
+// In the page console on instance A, after opening a populated panel:
+const key = 'excal_draw_v1_' + session.recordGuid;
+const ls = JSON.parse(localStorage.getItem(key) || '{}');
+const dbEls = ls?.scene?.sceneJson ? JSON.parse(ls.scene.sceneJson)?.elements?.length : 0;
+console.log('localStorage elements:', dbEls, 'live elements:', excalApi.getSceneElements().length);
+// If localStorage has 0 and live has >0 — DB-wins kicked in, good.
+// If localStorage has 0 and live has 0 — check _reloadDrawingDoc fired.
+```
+
+Or, add a probe to `_loadDrawingDoc` just before the return:
+```js
+console.log(`DIAG load: fromCollection=${!!fromCollection}(${fromCollection?._countDocNonDeleted?.(fromCollection)}) fromRow=${!!fromRow} fromLocal=${!!fromLocal}(${fromLocal?._countDocNonDeleted?.(fromLocal)}) picked=${picked === fromCollection ? 'collection' : picked === fromRow ? 'row' : 'local'}`);
+```
+
 ---
 
 ## 6. Worked example: debugging bug 3 end-to-end

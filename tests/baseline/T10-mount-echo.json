@@ -1,0 +1,44 @@
+{
+  "ok": true,
+  "verdict": {
+    "pre": {
+      "updatedAt": "2026-07-01T15:52:35.733Z",
+      "elementCount": 17
+    },
+    "post": {
+      "updatedAt": "2026-07-01T15:52:35.733Z",
+      "elementCount": 17
+    },
+    "liveAfterMount": 17,
+    "liveAfterWait": 17,
+    "dbUnchanged": true,
+    "guardsFired": true,
+    "echoSuppressedCount": 2,
+    "mountEchoCount": 86,
+    "emptyOverPopCount": 0,
+    "pass": true
+  },
+  "diags": {
+    "onChangeCount": 86,
+    "echoSuppressed": 2,
+    "mountEchoSuppressed": 86,
+    "emptyOverPopulatedWarned": 0,
+    "savingOrDirtyLines": 0,
+    "guardsFired": true,
+    "firstOnChangeLines": [
+      "[Excalidraw] DIAG: onChange 17 els, applyingRemote=false echoSuppressed=true mountEcho=true emptyOverPopulated=false dbAwareBlocked=false EXCAL_VERSION=0.6.2",
+      "[Excalidraw] DIAG: onChange 17 els, applyingRemote=false echoSuppressed=true mountEcho=true emptyOverPopulated=false dbAwareBlocked=false EXCAL_VERSION=0.6.2",
+      "[Excalidraw] DIAG: onChange 17 els, applyingRemote=false echoSuppressed=false mountEcho=true emptyOverPopulated=false dbAwareBlocked=false EXCAL_VERSION=0.6.2",
+      "[Excalidraw] DIAG: onChange 17 els, applyingRemote=false echoSuppressed=false mountEcho=true emptyOverPopulated=false dbAwareBlocked=false EXCAL_VERSION=0.6.2",
+      "[Excalidraw] DIAG: onChange 17 els, applyingRemote=false echoSuppressed=false mountEcho=true emptyOverPopulated=false dbAwareBlocked=false EXCAL_VERSION=0.6.2",
+      "[Excalidraw] DIAG: onChange 17 els, applyingRemote=false echoSuppressed=false mountEcho=true emptyOverPopulated=false dbAwareBlocked=false EXCAL_VERSION=0.6.2"
+    ],
+    "lastOnChangeLines": [
+      "[Excalidraw] DIAG: onChange 17 els, applyingRemote=false echoSuppressed=false mountEcho=true emptyOverPopulated=false dbAwareBlocked=false EXCAL_VERSION=0.6.2",
+      "[Excalidraw] DIAG: onChange 17 els, applyingRemote=false echoSuppressed=false mountEcho=true emptyOverPopulated=false dbAwareBlocked=false EXCAL_VERSION=0.6.2",
+      "[Excalidraw] DIAG: onChange 17 els, applyingRemote=false echoSuppressed=false mountEcho=true emptyOverPopulated=false dbAwareBlocked=false EXCAL_VERSION=0.6.2",
+      "[Excalidraw] DIAG: onChange 17 els, applyingRemote=false echoSuppressed=false mountEcho=true emptyOverPopulated=false dbAwareBlocked=false EXCAL_VERSION=0.6.2"
+    ]
+  },
+  "excalVersionLine": "[Excalidraw] DIAG: onChange 17 els, applyingRemote=false echoSuppressed=true mountEcho=true emptyOverPopulated=false dbAwareBlocked=false EXCAL_VERSION=0.6.2"
+}

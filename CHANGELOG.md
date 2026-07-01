@@ -1,5 +1,49 @@
 # ThymerExcalidraw Changelog
 
+## 0.6.2 — 2026-07-01
+
+### Fixed (stale localStorage could override populated DB; partial-scene save via WS could overwrite populated DB)
+
+- **Root cause (v0.6.2).** Even after the v0.6.1 mount-echo fix
+  prevented NEW empty scenes from being written, existing stale
+  empty localStorage entries from pre-v0.6.1 bleaches could still
+  override the DB on load. The `_pickNewerDoc` function compared
+  only `updatedAt` timestamps — a newer empty localStorage entry
+  would win over an older populated DB entry. Symptom: "Open
+  Excalidraw on instance A → blank canvas. Move objects on
+  instance B → they appear on A." The WS subscription is keyed
+  on the source record GUID, so A received B's WS deltas even
+  when A's load returned empty from poisoned localStorage.
+- **Fix 1: Content-aware merge.** In `_loadDrawingDoc`, if the DB
+  has non-empty elements and localStorage is empty, the DB wins
+  regardless of `updatedAt`. Prevents stale localStorage from
+  blanking the canvas on load.
+- **Fix 2: Heal poisoned localStorage.** After a successful load
+  from the DB, write the DB doc back to localStorage. Clears
+  stale empty entries for future loads.
+- **Fix 3: Block WS deltas when load failed.** In
+  `_handleIncomingWsMessage`, if `session.drawingRecordGuid` is
+  null (load failed or returned empty), skip the delta and trigger
+  `_reloadDrawingDoc` instead. Prevents partial-scene accumulation
+  on a blank canvas.
+- **Fix 4: DB-aware save guard (Layer 4).** In the onChange handler
+  and `_flushPanelSession`, compare the live element count against
+  `_dbSceneElementCount` (tracked from the DB at load time). If
+  the live scene has fewer elements and no explicit deletions,
+  refuse the save. This is the strongest data-loss prevention —
+  even if the load returns empty but WS deltas arrive, a partial
+  scene can never overwrite the populated DB.
+- **Fix 5: WS filter also matches `drawingRecordGuid`.** The WS
+  message filter now checks both `session.recordGuid` and
+  `session.drawingRecordGuid`, ensuring cross-tab sync arrives
+  even when the source-record filter would not cover it.
+- Added `_countDocNonDeleted(doc)` helper and `_reloadDrawingDoc`
+  method. New session field `_dbSceneElementCount`.
+- Added DEBUG.md §5.14 documenting the localStorage poisoning
+  gotcha and all five fixes.
+- Tests: T11 (localStorage poisoning), T12 (cross-tab partial-save
+  guard), T13 (DB-wins reconciliation), T14 (load fail + WS delta).
+
 ## 0.6.1 — 2026-07-01
 
 ### Fixed (panel-open could overwrite populated drawing with empty scene)
