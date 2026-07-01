@@ -2426,7 +2426,7 @@ const EXCAL_PLUGIN_ID = 'excalidraw';
 const EXCAL_MODE_KEY = 'thymerext_ps_mode_excalidraw';
 const EXCAL_DRAW_PREFIX = 'excal_draw_v1_';
 const EXCAL_PANEL_TYPE = 'excalidraw-editor';
-const EXCAL_VERSION = '0.5.9';
+const EXCAL_VERSION = '0.6.0';
 const EXCAL_ICON = 'ti-palette';
 const EXCAL_FRAME_PAD_X = 12;
 const EXCAL_FRAME_PAD_TOP = 28;
@@ -2559,6 +2559,7 @@ class Plugin extends AppPlugin {
     this._myUserGuid = null;
     this._realtimeUnsubs = [];
     this._pagehideUnsub = null;
+    this._showDataPanelIds = new Set();
 
     // v0.5.9: page-hide flush. When the user closes the tab/window
     // or backgrounds the tab, force a flush of any pending scene.
@@ -3473,7 +3474,11 @@ class Plugin extends AppPlugin {
     const status = String(statusText || '').trim();
     const el = session?.statusEl;
     if (!el) return;
-    el.textContent = status || '';
+    if (session?.statusTextEl) {
+      session.statusTextEl.textContent = status || '';
+    } else {
+      el.textContent = status || '';
+    }
     el.classList.remove(
       'excal-status--idle',
       'excal-status--dirty',
@@ -3877,6 +3882,9 @@ class Plugin extends AppPlugin {
         left: 50%;
         transform: translateX(-50%);
         z-index: 20;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
         padding: 9px 20px;
         font-size: 13px;
         font-weight: 700;
@@ -3997,6 +4005,29 @@ class Plugin extends AppPlugin {
         background: rgba(0, 0, 0, 0.2);
         z-index: 2;
         border-radius: ${EXCAL_INNER_RADIUS}px;
+      }
+      .excal-panel-statusbar > .excal-data-btn {
+        pointer-events: auto;
+        display: inline-block;
+        width: 22px;
+        height: 22px;
+        padding: 0;
+        margin: 0;
+        border: none;
+        border-radius: 4px;
+        background: transparent;
+        color: inherit;
+        font-size: 13px;
+        line-height: 22px;
+        text-align: center;
+        cursor: pointer;
+        opacity: 0.6;
+        transition: opacity 0.15s;
+        flex-shrink: 0;
+      }
+      .excal-panel-statusbar > .excal-data-btn:hover {
+        opacity: 1;
+        background: rgba(255, 255, 255, 0.15);
       }
     `);
   }
@@ -4220,6 +4251,8 @@ class Plugin extends AppPlugin {
 
     const record = panel?.getActiveRecord?.();
 
+    if (this._showDataPanelIds?.has(panel?.getId?.())) return;
+
     if (this._navInterceptBusy || !record) return;
     if (!this._isDrawingBackendRecord(record)) return;
 
@@ -4387,14 +4420,42 @@ class Plugin extends AppPlugin {
 
     const statusBar = document.createElement('div');
     statusBar.className = 'excal-panel-statusbar';
-    statusBar.textContent = 'Loading…';
+    const statusText = document.createElement('span');
+    statusText.textContent = 'Loading…';
+    statusBar.appendChild(statusText);
     session.statusEl = statusBar;
+    session.statusTextEl = statusText;
 
     const loading = document.createElement('div');
     loading.className = 'excal-panel-loading';
     loading.textContent = 'Loading Excalidraw…';
     stage.appendChild(loading);
     stage.appendChild(statusBar);
+
+    if (session.drawingRecordGuid) {
+      const dataBtn = document.createElement('button');
+      dataBtn.className = 'excal-data-btn';
+      dataBtn.title = 'Show raw drawing record (version history)';
+      dataBtn.textContent = '\u{1F4CB}';
+      dataBtn.addEventListener('click', async () => {
+        const dg = session.drawingRecordGuid;
+        if (!dg) return;
+        try {
+          const np = await this.ui.createPanel?.({ afterPanel: session.panel || undefined });
+          if (np) {
+            if (np?.getId) this._showDataPanelIds?.add(np.getId());
+            np.navigateTo({
+              type: 'edit_panel',
+              rootId: dg,
+              workspaceGuid: this.getWorkspaceGuid?.() || null,
+            });
+          }
+        } catch (e) {
+          console.warn(`[${EXCAL_PLUGIN_NAME}] Show data`, e);
+        }
+      });
+      statusBar.appendChild(dataBtn);
+    }
 
     root.appendChild(stage);
     el.appendChild(root);

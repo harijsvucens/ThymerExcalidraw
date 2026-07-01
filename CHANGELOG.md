@@ -1,5 +1,17 @@
 # ThymerExcalidraw Changelog
 
+## 0.6.0 — 2026-06-30
+
+### Added (Show Data button in Excalidraw panel)
+
+- **"Show Data" button** (`📋`) in the top-right corner of the Excalidraw editor panel.
+  When clicked, opens the raw drawing record in a new panel where Thymer's version
+  history is accessible. The Excalidraw panel stays open alongside it.
+- **`_skipInterceptForGuid` guard** in `_refreshPanelChrome`. When the button navigates
+  to the drawing record, a skip flag prevents the auto-intercept from redirecting
+  back to the source note, so the raw record data view persists.
+- Bumped `EXCAL_VERSION` to `0.6.0` and `plugin.json` version to `0.6.0`.
+
 ## 0.5.9 — 2026-06-30
 
 ### Fixed (close-Tymer-quickly loses unsaved changes)
